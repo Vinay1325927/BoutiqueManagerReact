@@ -9,9 +9,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 
-// Keep compatibility with the original Streamlit project, which stores its
-// production configuration in credentials/.env. A root .env takes precedence.
-dotenv.config({ path: 'credentials/.env', quiet: true })
 dotenv.config({ path: '.env', override: true, quiet: true })
 
 const app = express()
@@ -26,16 +23,26 @@ app.use(express.json({ limit: '10mb' }))
 const memory = new Map()
 const counters = new Map()
 let database = null
+let databasePromise = null
 
 const collections = ['sales', 'inventory', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors']
 for (const name of collections) memory.set(name, [])
 
 async function connectDb() {
-  if (!process.env.MONGO_URI) return
-  const client = new MongoClient(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
-  await client.connect()
-  database = client.db(process.env.MONGO_DB || 'boutique_db')
-  console.log(`MongoDB connected: ${database.databaseName}`)
+  if (database) return database
+  if (databasePromise) return databasePromise
+  if (!process.env.MONGO_URI) {
+    if (process.env.VERCEL) throw new Error('MONGO_URI is not configured in Vercel Environment Variables.')
+    return null
+  }
+  databasePromise = (async () => {
+    const client = new MongoClient(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
+    await client.connect()
+    database = client.db(process.env.MONGO_DB || 'boutique_db')
+    console.log(`MongoDB connected: ${database.databaseName}`)
+    return database
+  })().catch((error) => { databasePromise = null; throw error })
+  return databasePromise
 }
 
 const clean = (value) => JSON.parse(JSON.stringify(value, (_key, val) =>
@@ -81,6 +88,20 @@ async function remove(name, query) {
 }
 
 function runPython(action, payload, timeoutMs = 90000) {
+  if (process.env.VERCEL) {
+    const deploymentHost = process.env.VERCEL_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL
+    if (!deploymentHost) return Promise.reject(new Error('Vercel deployment URL is unavailable for the PDF service.'))
+    return fetch(`https://${deploymentHost}/pdf-service`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': process.env.BRIDGE_SECRET || jwtSecret },
+      body: JSON.stringify({ action, payload }),
+      signal: AbortSignal.timeout(timeoutMs),
+    }).then(async (response) => {
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok || !data.ok) throw new Error(data.error || 'Python PDF service failed.')
+      return data.result
+    })
+  }
   const configured = process.env.PYTHON_BIN
   const venvPython = path.join(projectRoot, '.venv', 'bin', 'python')
   const python = configured || venvPython
@@ -103,6 +124,11 @@ function runPython(action, payload, timeoutMs = 90000) {
     child.stdin.end(JSON.stringify({ action, payload }))
   })
 }
+
+app.use(async (_req, _res, next) => {
+  if (!process.env.VERCEL) return next()
+  try { await connectDb(); next() } catch (error) { next(error) }
+})
 
 function sign(user, role = 'admin') { return jwt.sign({ user, role }, jwtSecret, { expiresIn: '12h' }) }
 function auth(req, res, next) {
@@ -288,4 +314,8 @@ app.use((req, res, next) => {
   next()
 })
 
-connectDb().catch((error) => console.warn(`MongoDB unavailable; using in-memory storage: ${error.message}`)).finally(() => app.listen(port, () => console.log(`Boutique API listening on http://localhost:${port}`)))
+if (!process.env.VERCEL) {
+  connectDb().catch((error) => console.warn(`MongoDB unavailable; using in-memory storage: ${error.message}`)).finally(() => app.listen(port, () => console.log(`Boutique API listening on http://localhost:${port}`)))
+}
+
+export default app

@@ -1,4 +1,4 @@
-#!/Users/mvinay/Downloads/CODEX/boutique.py/.venv/bin/python
+#!/Users/mvinay/Downloads/CODEX/boutique.py/.venv/bin/python3.14
 import sys
 from cffi._cffi_gen_src import run
 if __name__ == '__main__':

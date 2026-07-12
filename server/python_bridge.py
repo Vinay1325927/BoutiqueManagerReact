@@ -1,8 +1,7 @@
 """Python services reused by the React/Express application.
 
 Input and output are JSON over stdin/stdout so credentials and Mongo access stay
-in the Node API. Heavy PDF work continues to use the proven Python libraries from
-the original Streamlit application.
+in the Node API. Heavy PDF work uses focused Python PDF libraries.
 """
 
 import base64
@@ -18,7 +17,7 @@ from urllib.parse import quote
 
 BRAND_NAME = "Shree Krishna Boutique"
 UPI_ID = "9176619942@ybl"
-SYMBOL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "krishna_symbol.png")
+SYMBOL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "krishna_symbol.png")
 
 
 def clean(value):

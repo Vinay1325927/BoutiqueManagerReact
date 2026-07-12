@@ -3,12 +3,16 @@
   "version": "3.0.0",
   "private": true,
   "type": "module",
+  "engines": { "node": "24.x" },
   "scripts": {
+    "setup:python": "node scripts/ensure-python.js",
+    "predev": "npm run setup:python",
     "dev": "concurrently -n API,WEB -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
     "dev:web": "vite",
     "dev:server": "node --watch server/index.js",
     "build": "vite build",
     "preview": "vite preview",
+    "prestart": "npm run setup:python",
     "start": "node server/index.js"
   },
   "dependencies": {

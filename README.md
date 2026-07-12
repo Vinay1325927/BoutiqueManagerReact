@@ -7,10 +7,10 @@ A React single-page application with an Express API and focused Python PDF servi
 ```bash
 cp .env.example .env
 npm install
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
 npm run dev
 ```
+
+`npm run dev` automatically creates a small `.venv` containing only the passbook and billing PDF packages. Streamlit is not installed.
 
 Open `http://localhost:5173`. The API runs on `http://localhost:8787`.
 

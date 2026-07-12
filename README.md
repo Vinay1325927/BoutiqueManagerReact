@@ -1,29 +1,30 @@
 # Shree Krishna Boutique — React edition
 
-The original Streamlit application has been rebuilt as a React single-page application with an Express API. MongoDB and AI credentials remain server-side.
+A React single-page application with an Express API and focused Python PDF services. MongoDB and AI credentials remain server-side.
 
 ## Run locally
 
 ```bash
 cp .env.example .env
 npm install
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 npm run dev
 ```
 
 Open `http://localhost:5173`. The API runs on `http://localhost:8787`.
 
-Without `MONGO_URI`, the API uses temporary in-memory storage so the application can be previewed immediately. For persistent data, set `MONGO_URI` and `MONGO_DB` in `.env`. The API also reads the original Streamlit `credentials/.env`; values in the root `.env` take precedence when both files exist.
+Without `MONGO_URI`, the local API uses temporary in-memory storage so the application can be previewed. For persistent data, set `MONGO_URI` and `MONGO_DB` in `.env`.
 
 The development login defaults to `admin` / `admin` when neither `PASSWORD` nor `PASSWORD_HASH` is configured. Always set `JWT_SECRET`, `USERNAME`, and a production password before deployment.
 
-## Production
+## Deploy to Vercel
 
-```bash
-npm run build
-npm start
-```
+Import this repository into Vercel. The included `vercel.json` builds the Vite frontend, deploys Express as a Node.js Function, and deploys passbook/bill processing as a separate Python Function.
 
-Express serves the compiled React application from `dist/` and exposes the protected API under `/api`.
+Add every required value from `.env.example` under **Project Settings → Environment Variables**. At minimum configure `MONGO_URI`, `MONGO_DB`, `JWT_SECRET`, `BRIDGE_SECRET`, `USERNAME`, and either `PASSWORD` or `PASSWORD_HASH`.
+
+Passbook extraction and bill PDF generation are handled by `server/python_bridge.py`. Local development uses `.venv`; Vercel installs the minimal packages from `requirements.txt` for `api/pdf.py`.
 
 ## Included workflows
 
@@ -42,4 +43,5 @@ Express serves the compiled React application from `dist/` and exposes the prote
 - Excel account export
 - Responsive light and dark interfaces
 
-The previous Python files are retained as a migration reference. The active application entry points are `src/main.jsx` and `server/index.js`.
+The application entry points are `src/main.jsx`, `api/index.js`, and `api/pdf.py`.
+# BoutiqueManagerReact

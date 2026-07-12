@@ -21,15 +21,12 @@
     "lucide-react": "^0.468.0",
     "mongodb": "^6.17.0",
     "multer": "^2.0.1",
-    "pdf-parse": "^1.1.1",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.6.3",
     "recharts": "^2.15.4",
-    "write-excel-file": "^2.3.10",
-    "jspdf": "^4.2.1",
-    "jspdf-autotable": "^5.0.2"
+    "write-excel-file": "^2.3.10"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.6.0",

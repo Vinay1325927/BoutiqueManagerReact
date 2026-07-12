@@ -9,3 +9,6 @@ __pycache__/
 .vercel/
 *.log
 .DS_Store
+.env.local
+.env.*.local
+!.env.example

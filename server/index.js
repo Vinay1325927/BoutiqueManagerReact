@@ -87,18 +87,40 @@ async function remove(name, query) {
   return { deletedCount: i >= 0 ? 1 : 0 }
 }
 
-function runPython(action, payload, timeoutMs = 90000) {
+function readableError(value, fallback = 'Unexpected server error.') {
+  if (!value) return fallback
+  if (typeof value === 'string') return value
+  if (value instanceof Error) return value.message || fallback
+  if (typeof value === 'object') {
+    const nested = value.error && typeof value.error === 'object' ? value.error : value
+    if (nested.message) return nested.code ? `${nested.code}: ${nested.message}` : nested.message
+    try { return JSON.stringify(value) } catch { return fallback }
+  }
+  return String(value)
+}
+
+function runPython(action, payload, timeoutMs = 90000, requestContext = {}) {
   if (process.env.VERCEL) {
-    const deploymentHost = process.env.VERCEL_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL
+    const deploymentHost = requestContext.host || process.env.VERCEL_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL
     if (!deploymentHost) return Promise.reject(new Error('Vercel deployment URL is unavailable for the PDF service.'))
+    const bridgeHeaders = {
+      'Content-Type': 'application/json',
+      'X-Bridge-Secret': process.env.BRIDGE_SECRET || jwtSecret,
+    }
+    // The PDF function is another function in this protected deployment.
+    // Forward the caller's Vercel session or automation bypass so the
+    // server-to-server request is not redirected to the SSO page.
+    const bypass = requestContext.protectionBypass || process.env.VERCEL_AUTOMATION_BYPASS_SECRET
+    if (bypass) bridgeHeaders['x-vercel-protection-bypass'] = bypass
+    if (requestContext.cookie) bridgeHeaders.cookie = requestContext.cookie
     return fetch(`https://${deploymentHost}/pdf-service`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': process.env.BRIDGE_SECRET || jwtSecret },
+      headers: bridgeHeaders,
       body: JSON.stringify({ action, payload }),
       signal: AbortSignal.timeout(timeoutMs),
     }).then(async (response) => {
       const data = await response.json().catch(() => ({}))
-      if (!response.ok || !data.ok) throw new Error(data.error || 'Python PDF service failed.')
+      if (!response.ok || !data.ok) throw new Error(readableError(data.error || data, 'Python PDF service failed.'))
       return data.result
     })
   }
@@ -123,6 +145,14 @@ function runPython(action, payload, timeoutMs = 90000) {
     })
     child.stdin.end(JSON.stringify({ action, payload }))
   })
+}
+
+function pythonRequestContext(req) {
+  return {
+    host: req.get('host'),
+    cookie: req.headers.cookie || '',
+    protectionBypass: req.headers['x-vercel-protection-bypass'] || '',
+  }
 }
 
 app.use(async (_req, _res, next) => {
@@ -236,7 +266,7 @@ app.post('/api/bills/generate', auth, async (req, res, next) => { try {
   const dayKey = billDate.replaceAll('-', '')
   const billId = `SKB-${dayKey}-${String(await nextId(`bill_${dayKey}`)).padStart(4, '0')}`
   const scopeLabel = scope === 'Last Transactions' ? `Last ${limit} Transactions` : scope
-  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel })
+  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel }, 90000, pythonRequestContext(req))
   const history = {
     bill_id: billId, bill_date: billDate, customer_name: customerName, customer_phone: generated.customer_phone,
     bill_scope: scope, bill_limit: scope === 'Last Transactions' ? limit : null, bill_scope_label: scopeLabel,
@@ -267,7 +297,7 @@ app.post('/api/restore', auth, async (req, res, next) => { try { const data = re
 app.post('/api/passbook/parse', auth, upload.array('files', 10), async (req, res, next) => { try {
   if (!req.files?.length) return res.status(400).json({ error: 'Choose one or more PDF files.' })
   const files = req.files.map((file) => ({ filename: file.originalname, base64: file.buffer.toString('base64') }))
-  res.json(await runPython('parse_passbooks', { files }))
+  res.json(await runPython('parse_passbooks', { files }, 90000, pythonRequestContext(req)))
 } catch (e) { next(e) } })
 app.get('/api/passbook/vendors', auth, async (_req, res, next) => { try {
   const rows = await list('passbook_vendors'); res.json(rows.map((row) => row.name).filter(Boolean).sort((a, b) => a.localeCompare(b)))
@@ -305,7 +335,7 @@ app.post('/api/ai', auth, async (req, res, next) => { try {
   res.json({ answer: await askAI(String(req.body.question || ''), context) })
 } catch (e) { next(e) } })
 
-app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ error: err.message || 'Unexpected server error.' }) })
+app.use((err, _req, res, _next) => { const message = readableError(err); console.error(message); res.status(500).json({ error: message }) })
 
 const dist = path.resolve(__dirname, '../dist')
 app.use(express.static(dist))

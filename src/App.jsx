@@ -43,8 +43,20 @@ async function request(path, options = {}) {
   }
   if (response.status === 204) return null
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || 'Request failed.')
+  if (!response.ok) throw new Error(formatError(data.error || data, 'Request failed.'))
   return data
+}
+
+function formatError(value, fallback = 'Request failed.') {
+  if (!value) return fallback
+  if (typeof value === 'string') return value
+  if (value instanceof Error) return value.message || fallback
+  if (typeof value === 'object') {
+    const nested = value.error && typeof value.error === 'object' ? value.error : value
+    if (nested.message) return nested.code ? `${nested.code}: ${nested.message}` : nested.message
+    try { return JSON.stringify(value) } catch { return fallback }
+  }
+  return String(value)
 }
 
 function Button({ children, variant = 'primary', icon: Icon, className = '', ...props }) {

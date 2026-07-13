@@ -84,10 +84,32 @@ function Notice({ value, clear }) { return value ? <div className={`notice ${val
 
 const blankSale = () => ({ customer_name: '', customer_phone: '', sale_date: today(), vendor: '', product_category: 'Sarees', product_description: '', buying_price: '', selling_price: '', amount_paid: '', payment_method: 'UPI', delay_status: false, notes: '' })
 
-function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sale' }) {
+function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sale', customerSales = [] }) {
   const [form, setForm] = useState(initial || blankSale())
   const [busy, setBusy] = useState(false)
+  const [customerMode, setCustomerMode] = useState('existing')
+  const customerOptions = useMemo(() => {
+    const customers = new Map()
+    ;[...customerSales]
+      .sort((a, b) => String(b.sale_date || '').localeCompare(String(a.sale_date || '')) || Number(b.id || 0) - Number(a.id || 0))
+      .forEach((sale) => {
+        const name = String(sale.customer_name || '').trim(), key = name.toLocaleLowerCase(), phone = String(sale.customer_phone || '').trim()
+        if (name && !customers.has(key)) customers.set(key, { name, phone })
+        else if (name && phone && !customers.get(key).phone) customers.get(key).phone = phone
+      })
+    return [...customers.values()].sort((a, b) => a.name.localeCompare(b.name))
+  }, [customerSales])
+  const canChooseExisting = !initial && !publicMode && customerOptions.length > 0
+  const choosingExisting = canChooseExisting && customerMode === 'existing'
   const set = (key, value) => setForm((old) => ({ ...old, [key]: value }))
+  const changeCustomerMode = (mode) => {
+    setCustomerMode(mode)
+    setForm((old) => ({ ...old, customer_name: '', customer_phone: '' }))
+  }
+  const chooseCustomer = (name) => {
+    const customer = customerOptions.find((item) => item.name === name)
+    setForm((old) => ({ ...old, customer_name: name, customer_phone: customer?.phone || '' }))
+  }
   const pending = Math.max(0, Number(form.selling_price || 0) - Number(form.amount_paid || 0))
   async function submit(e) {
     e.preventDefault(); setBusy(true)
@@ -95,7 +117,8 @@ function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sal
   }
   return <form onSubmit={submit} className="sale-form">
     <div className="form-section"><div className="section-title"><UserRound size={18} /><div><h3>Customer</h3><p>Contact and transaction date</p></div></div>
-      <div className="form-grid three"><Field label="Customer name" value={form.customer_name} onChange={(e) => set('customer_name', e.target.value)} required /><Field label="Phone number" value={form.customer_phone} onChange={(e) => set('customer_phone', e.target.value)} /><Field label="Sale date" type="date" value={form.sale_date} onChange={(e) => set('sale_date', e.target.value)} required /></div>
+      {canChooseExisting && <div className="customer-mode sale-customer-mode"><div><span>Customer type</span><small>Select an existing customer to add another order to their account.</small></div><div className="segmented"><button type="button" data-testid="existing-customer-mode" className={customerMode === 'existing' ? 'active' : ''} onClick={() => changeCustomerMode('existing')}>Existing customer</button><button type="button" data-testid="new-customer-mode" className={customerMode === 'new' ? 'active' : ''} onClick={() => changeCustomerMode('new')}>New customer</button></div></div>}
+      <div className="form-grid three">{choosingExisting ? <Field label="Existing customer" as="select" data-testid="existing-customer-select" value={form.customer_name} onChange={(e) => chooseCustomer(e.target.value)} required><option value="">Choose a customer…</option>{customerOptions.map((customer) => <option value={customer.name} key={customer.name}>{customer.name}{customer.phone ? ` — ${customer.phone}` : ''}</option>)}</Field> : <Field label="Customer name" data-testid="new-customer-name" value={form.customer_name} onChange={(e) => set('customer_name', e.target.value)} required />}<Field label="Phone number" data-testid="sale-phone" value={form.customer_phone} onChange={(e) => set('customer_phone', e.target.value)} placeholder={choosingExisting ? 'Auto-filled from customer' : ''} /><Field label="Sale date" type="date" value={form.sale_date} onChange={(e) => set('sale_date', e.target.value)} required /></div>
     </div>
     <div className="form-section"><div className="section-title"><ShoppingBag size={18} /><div><h3>Item details</h3><p>Product, category and sourcing</p></div></div>
       <div className="form-grid three"><Field label="Category" as="select" value={form.product_category} onChange={(e) => set('product_category', e.target.value)}>{CATEGORIES.map((x) => <option key={x}>{x}</option>)}</Field><Field label="Vendor" value={form.vendor} onChange={(e) => set('vendor', e.target.value)} /><Field label="Description" value={form.product_description} onChange={(e) => set('product_description', e.target.value)} /></div>
@@ -152,7 +175,7 @@ function Dashboard({ sales, go }) {
   return <><PageHead eyebrow="Business snapshot" title="Good to see you." action={<Button icon={Plus} onClick={() => go('add-sale')}>New sale</Button>} /><div className="metrics-grid"><Metric label="Total revenue" value={money(m.revenue)} hint={`${m.count} transactions`} icon={IndianRupee} /><Metric label="Gross profit" value={money(m.profit)} hint={`${m.revenue ? ((m.profit / m.revenue) * 100).toFixed(1) : 0}% margin`} icon={TrendingUp} tone="green" /><Metric label="Pending" value={money(m.pending)} hint="Needs collection" icon={WalletCards} tone="amber" /><Metric label="Customers" value={m.customers} hint="Unique customers" icon={UsersRound} tone="violet" /></div><div className="dashboard-grid"><Card className="chart-card"><div className="card-title"><div><h2>Revenue overview</h2><p>Revenue and gross profit by month</p></div><span className="badge blue">Last 8 months</span></div>{monthly.length ? <ResponsiveContainer width="100%" height={300}><AreaChart data={monthly}><defs><linearGradient id="revenue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#2563eb" stopOpacity={.3}/><stop offset="100%" stopColor="#2563eb" stopOpacity={0}/></linearGradient></defs><CartesianGrid vertical={false} stroke="var(--chart-grid)" /><XAxis dataKey="month" axisLine={false} tickLine={false}/><YAxis axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v/1000}k`}/><Tooltip formatter={(v) => money(v)} /><Area type="monotone" dataKey="revenue" stroke="#2563eb" strokeWidth={3} fill="url(#revenue)"/><Line type="monotone" dataKey="profit" stroke="#059669" /></AreaChart></ResponsiveContainer> : <Empty icon={BarChart3} title="No chart data" copy="Add your first sale to start the revenue trend." />}</Card><Card className="quick-card"><div className="card-title"><div><h2>Quick actions</h2><p>Common daily tasks</p></div></div>{[['Record a sale','Create a customer transaction',Plus,'add-sale'],['Collect payment','Review pending accounts',CircleDollarSign,'review'],['Create a bill','Generate a customer invoice',ReceiptText,'bill'],['Add work note','Log today’s bookkeeping',NotebookPen,'notes']].map(([title,copy,Icon,id]) => <button key={id} onClick={() => go(id)}><span><Icon /></span><div><strong>{title}</strong><small>{copy}</small></div><ChevronRight /></button>)}</Card></div><Card className="table-card"><div className="card-title"><div><h2>Recent transactions</h2><p>Latest boutique activity</p></div><Button variant="ghost" onClick={() => go('review')}>View all</Button></div><SalesTable rows={recent} /></Card></>
 }
 
-function AddSale({ reload, notice }) { async function save(form) { try { await request('/sales', { method: 'POST', body: JSON.stringify(form) }); notice({ text: 'Sale saved successfully.' }); await reload() } catch (e) { notice({ type: 'error', text: e.message }); throw e } } return <><PageHead eyebrow="Sales desk" title="Add a new sale" /><Card className="form-card"><SaleForm onSave={save} /></Card></> }
+function AddSale({ sales, reload, notice }) { async function save(form) { try { await request('/sales', { method: 'POST', body: JSON.stringify(form) }); notice({ text: 'Sale saved successfully.' }); await reload() } catch (e) { notice({ type: 'error', text: e.message }); throw e } } return <><PageHead eyebrow="Sales desk" title="Add a new sale" /><Card className="form-card"><SaleForm customerSales={sales} onSave={save} /></Card></> }
 
 function SalesTable({ rows, actions }) {
   if (!rows.length) return <Empty icon={ReceiptText} title="No transactions found" />

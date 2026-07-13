@@ -17,7 +17,20 @@ from urllib.parse import quote
 
 BRAND_NAME = "Shree Krishna Boutique"
 UPI_ID = "9176619942@ybl"
-SYMBOL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "krishna_symbol.png")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+SYMBOL_PATH = next(
+    (
+        path
+        for path in (
+            os.path.join(PROJECT_ROOT, "public", "krishna_symbol.png"),
+            os.path.join(PROJECT_ROOT, "dist", "krishna_symbol.png"),
+            os.path.join(os.getcwd(), "public", "krishna_symbol.png"),
+            os.path.join(os.getcwd(), "dist", "krishna_symbol.png"),
+        )
+        if os.path.exists(path)
+    ),
+    "",
+)
 
 
 def clean(value):

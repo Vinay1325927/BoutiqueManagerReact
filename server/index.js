@@ -8,6 +8,7 @@ import { MongoClient } from 'mongodb'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
+import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from 'node:crypto'
 
 dotenv.config({ path: '.env', override: true, quiet: true })
 
@@ -25,7 +26,8 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const collections = ['sales', 'inventory', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors']
+const collections = ['sales', 'inventory', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'auth_challenges']
+const backupCollections = collections.filter((name) => name !== 'auth_challenges')
 for (const name of collections) memory.set(name, [])
 
 async function connectDb() {
@@ -85,6 +87,63 @@ async function remove(name, query) {
   const rows = memory.get(name); const i = rows.findIndex((row) => Object.entries(query).every(([k, v]) => row[k] === v))
   if (i >= 0) rows.splice(i, 1)
   return { deletedCount: i >= 0 ? 1 : 0 }
+}
+
+async function consumeChallenge(id, key) {
+  const usedAt = now()
+  if (database) {
+    const row = await database.collection('auth_challenges').findOneAndUpdate(
+      { id, username_key: key, used: false, expires_at: { $gt: usedAt } },
+      { $set: { used: true, used_at: usedAt } },
+      { returnDocument: 'before', projection: { _id: 0 } },
+    )
+    return clean(row)
+  }
+  const row = await one('auth_challenges', { id })
+  if (!row || row.username_key !== key || row.used || row.expires_at <= usedAt) return null
+  row.used = true; row.used_at = usedAt
+  return clean(row)
+}
+
+const FEATURE_IDS = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'inventory', 'passbook', 'notes', 'ai', 'technical', 'backup']
+const CUSTOM_FEATURE_IDS = FEATURE_IDS.filter((id) => id !== 'backup')
+const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'inventory', 'notes', 'ai']
+const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
+const now = () => new Date().toISOString()
+
+function publicUser(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    username: row.username,
+    role: row.role,
+    permissions: row.role === 'admin' ? FEATURE_IDS : row.role === 'viewer' ? VIEWER_FEATURES : (row.permissions || []).filter((id) => CUSTOM_FEATURE_IDS.includes(id)),
+    active: row.active !== false,
+    source: row.source || 'managed',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_login_at: row.last_login_at,
+    pem: {
+      enabled: Boolean(row.pem_public_key),
+      fingerprint: row.pem_fingerprint || '',
+      filename: row.pem_filename || '',
+      enrolled_at: row.pem_enrolled_at || '',
+    },
+  }
+}
+
+async function ensureEnvironmentAdmin() {
+  const username = String(process.env.USERNAME || 'admin').trim()
+  const key = usernameKey(username)
+  const existing = await one('iam_users', { username_key: key })
+  const patch = { username, username_key: key, role: 'admin', permissions: FEATURE_IDS, active: true, source: 'environment', updated_at: now() }
+  if (existing) {
+    await update('iam_users', { id: existing.id }, patch)
+    return { ...existing, ...patch }
+  }
+  const row = { id: randomUUID(), ...patch, created_at: now(), created_by: 'environment' }
+  await insert('iam_users', row)
+  return row
 }
 
 function readableError(value, fallback = 'Unexpected server error.') {
@@ -160,26 +219,50 @@ app.use(async (_req, _res, next) => {
   try { await connectDb(); next() } catch (error) { next(error) }
 })
 
-function sign(user, role = 'admin') { return jwt.sign({ user, role }, jwtSecret, { expiresIn: '12h' }) }
-function auth(req, res, next) {
+function sign(user, deviceId) {
+  return jwt.sign({ user: user.username, user_id: user.id, role: user.role, permissions: publicUser(user).permissions, device_id: deviceId }, jwtSecret, { expiresIn: '12h' })
+}
+
+async function auth(req, res, next) {
   try {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
-    req.user = jwt.verify(token, jwtSecret); next()
+    const payload = jwt.verify(token, jwtSecret)
+    let user
+    if (payload.user_id) user = await one('iam_users', { id: payload.user_id })
+    else if (payload.role === 'admin' && usernameKey(payload.user) === usernameKey(process.env.USERNAME || 'admin')) user = await ensureEnvironmentAdmin()
+    if (!user || user.active === false) return res.status(401).json({ error: 'This account is inactive or no longer exists.' })
+    if (payload.device_id) {
+      const device = await one('auth_devices', { id: payload.device_id })
+      if (device && device.active === false) return res.status(401).json({ error: 'This device session was revoked.' })
+    }
+    req.user = { user: user.username, username: user.username, user_id: user.id, role: user.role, permissions: publicUser(user).permissions, device_id: payload.device_id }
+    next()
   } catch { res.status(401).json({ error: 'Please sign in again.' }) }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, database: database ? 'mongodb' : 'memory' }))
-app.post('/api/auth/login', async (req, res) => {
-  const username = String(req.body.username || '')
-  const password = String(req.body.password || '')
-  const expectedUser = process.env.USERNAME || 'admin'
-  const validPassword = process.env.PASSWORD_HASH
-    ? await bcrypt.compare(password, process.env.PASSWORD_HASH)
-    : password === (process.env.PASSWORD || 'admin')
-  if (username !== expectedUser || !validPassword) return res.status(401).json({ error: 'Invalid username or password.' })
-  const device = { id: crypto.randomUUID(), username, role: 'admin', active: true, login_method: 'password', last_login_at: new Date().toISOString(), user_agent: req.headers['user-agent'] || '' }
-  // Device history is useful, but it must never leave a valid login spinning
-  // forever if MongoDB temporarily cannot write this non-critical audit row.
+function canAccess(user, feature, write = false) {
+  if (user.role === 'admin') return true
+  if (user.role === 'viewer') return !write && VIEWER_FEATURES.includes(feature)
+  return user.role === 'custom' && (user.permissions || []).includes(feature)
+}
+
+function permit(feature, { write = false, adminOnly = false } = {}) {
+  return (req, res, next) => {
+    if (adminOnly && req.user.role !== 'admin') return res.status(403).json({ error: 'Administrator access is required.' })
+    if (!adminOnly && !canAccess(req.user, feature, write)) return res.status(403).json({ error: write ? 'You do not have permission to change this feature.' : 'You do not have access to this feature.' })
+    next()
+  }
+}
+
+function permitAny(features, { write = false } = {}) {
+  return (req, res, next) => {
+    if (!features.some((feature) => canAccess(req.user, feature, write))) return res.status(403).json({ error: 'You do not have permission to perform this action.' })
+    next()
+  }
+}
+
+async function recordLogin(req, user, method) {
+  const device = { id: randomUUID(), username: user.username, user_id: user.id, role: user.role, active: true, login_method: method, last_login_at: now(), user_agent: req.headers['user-agent'] || '' }
   try {
     await Promise.race([
       insert('auth_devices', device),
@@ -188,9 +271,113 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     console.warn(`Login audit was not saved: ${error.message}`)
   }
-  res.json({ token: sign(username), user: { username, role: 'admin' }, deviceId: device.id })
+  await update('iam_users', { id: user.id }, { last_login_at: device.last_login_at })
+  return device
+}
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, database: database ? 'mongodb' : 'memory' }))
+app.post('/api/auth/login', async (req, res) => {
+  const username = String(req.body.username || '').trim()
+  const password = String(req.body.password || '')
+  const expectedUser = process.env.USERNAME || 'admin'
+  let user = await one('iam_users', { username_key: usernameKey(username) })
+  let validPassword = false
+  if (usernameKey(username) === usernameKey(expectedUser)) {
+    validPassword = process.env.PASSWORD_HASH
+      ? await bcrypt.compare(password, process.env.PASSWORD_HASH)
+      : password === (process.env.PASSWORD || 'admin')
+    if (validPassword) user = await ensureEnvironmentAdmin()
+  } else if (user?.password_hash) validPassword = await bcrypt.compare(password, user.password_hash)
+  if (!user || user.active === false || !validPassword) return res.status(401).json({ error: 'Invalid username or password.' })
+  const device = await recordLogin(req, user, 'password')
+  res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
 })
-app.get('/api/auth/me', auth, (req, res) => res.json(req.user))
+app.post('/api/auth/pem/challenge', async (req, res, next) => { try {
+  const key = usernameKey(req.body.username)
+  const user = await one('iam_users', { username_key: key })
+  if (!user || user.active === false || !user.pem_public_key) return res.status(401).json({ error: 'PEM sign-in is not configured for this account.' })
+  const row = { id: randomUUID(), username_key: key, challenge: randomBytes(32).toString('base64'), created_at: now(), expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(), used: false }
+  await insert('auth_challenges', row)
+  res.json({ challenge_id: row.id, challenge: row.challenge, expires_at: row.expires_at })
+} catch (e) { next(e) } })
+app.post('/api/auth/pem/login', async (req, res, next) => { try {
+  const key = usernameKey(req.body.username), challengeId = String(req.body.challenge_id || ''), signature = String(req.body.signature || '')
+  const user = await one('iam_users', { username_key: key })
+  const challenge = await consumeChallenge(challengeId, key)
+  if (!user || user.active === false || !user.pem_public_key || !challenge) return res.status(401).json({ error: 'The PEM challenge is invalid or expired. Please try again.' })
+  let valid = false
+  try { valid = verifySignature('sha256', Buffer.from(challenge.challenge, 'base64'), user.pem_public_key, Buffer.from(signature, 'base64')) } catch { valid = false }
+  if (!valid) return res.status(401).json({ error: 'The PEM file does not match this account.' })
+  const device = await recordLogin(req, user, 'pem')
+  res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
+} catch (e) { next(e) } })
+app.get('/api/auth/me', auth, async (req, res) => {
+  const user = await one('iam_users', { id: req.user.user_id })
+  res.json(publicUser(user))
+})
+
+app.get('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
+  await ensureEnvironmentAdmin()
+  const users = await list('iam_users')
+  users.sort((a, b) => String(a.username).localeCompare(String(b.username)))
+  res.json(users.map(publicUser))
+} catch (e) { next(e) } })
+app.post('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const username = String(req.body.username || '').trim(), key = usernameKey(username), password = String(req.body.password || '')
+  const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' })
+  if (password.length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
+  if (await one('iam_users', { username_key: key })) return res.status(409).json({ error: 'That username already exists.' })
+  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
+  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', password_hash: await bcrypt.hash(password, 12), created_at: now(), created_by: req.user.user, updated_at: now() }
+  await insert('iam_users', row)
+  res.status(201).json(publicUser(row))
+} catch (e) { next(e) } })
+app.patch('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const user = await one('iam_users', { id: req.params.id })
+  if (!user) return res.status(404).json({ error: 'IAM user not found.' })
+  if (user.source === 'environment') return res.status(400).json({ error: 'The environment administrator is managed through Vercel environment variables.' })
+  const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : user.role
+  const active = req.body.active === undefined ? user.active !== false : Boolean(req.body.active)
+  if (user.id === req.user.user_id && (role !== 'admin' || !active)) return res.status(400).json({ error: 'You cannot remove your own administrator access.' })
+  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
+  const patch = { role, active, permissions, updated_at: now(), updated_by: req.user.user }
+  if (req.body.password) {
+    if (String(req.body.password).length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
+    patch.password_hash = await bcrypt.hash(String(req.body.password), 12)
+  }
+  await update('iam_users', { id: user.id }, patch)
+  res.json(publicUser({ ...user, ...patch }))
+} catch (e) { next(e) } })
+app.delete('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const user = await one('iam_users', { id: req.params.id })
+  if (!user) return res.status(404).json({ error: 'IAM user not found.' })
+  if (user.source === 'environment' || user.id === req.user.user_id) return res.status(400).json({ error: 'This administrator account cannot be deleted.' })
+  await remove('iam_users', { id: user.id }); res.status(204).end()
+} catch (e) { next(e) } })
+app.put('/api/iam/users/:id/pem', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const user = await one('iam_users', { id: req.params.id })
+  if (!user) return res.status(404).json({ error: 'IAM user not found.' })
+  const pem = String(req.body.pem || '').trim()
+  if (!pem.includes('BEGIN PUBLIC KEY') && !pem.includes('BEGIN CERTIFICATE')) return res.status(400).json({ error: 'Upload a public PEM key or certificate. Private keys must stay on the user’s device.' })
+  let key, canonical, der
+  try {
+    key = createPublicKey(pem)
+    if (key.asymmetricKeyType !== 'rsa') throw new Error('Only RSA keys are supported.')
+    canonical = key.export({ type: 'spki', format: 'pem' }).toString()
+    der = key.export({ type: 'spki', format: 'der' })
+  } catch (error) { return res.status(400).json({ error: error.message || 'The public PEM file is invalid.' }) }
+  const patch = { pem_public_key: canonical, pem_fingerprint: createHash('sha256').update(der).digest('hex').match(/.{1,2}/g).join(':'), pem_filename: String(req.body.filename || 'public-key.pem').slice(0, 160), pem_enrolled_at: now(), pem_enrolled_by: req.user.user, updated_at: now() }
+  await update('iam_users', { id: user.id }, patch)
+  res.json(publicUser({ ...user, ...patch }))
+} catch (e) { next(e) } })
+app.delete('/api/iam/users/:id/pem', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const user = await one('iam_users', { id: req.params.id })
+  if (!user) return res.status(404).json({ error: 'IAM user not found.' })
+  const patch = { pem_public_key: '', pem_fingerprint: '', pem_filename: '', pem_enrolled_at: '', pem_enrolled_by: '', updated_at: now() }
+  await update('iam_users', { id: user.id }, patch)
+  res.json(publicUser({ ...user, ...patch }))
+} catch (e) { next(e) } })
 
 function saleFromBody(body) {
   const selling = Number(body.selling_price || 0), buying = Number(body.buying_price || 0), paid = Number(body.amount_paid || 0)
@@ -212,23 +399,23 @@ app.post('/api/public/sales', async (req, res, next) => { try {
   await insert('sales', row); res.status(201).json(row)
 } catch (e) { next(e) } })
 
-app.get('/api/sales', auth, async (_req, res, next) => { try {
+app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (_req, res, next) => { try {
   const rows = await list('sales'); rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date))); res.json(rows)
 } catch (e) { next(e) } })
-app.post('/api/sales', auth, async (req, res, next) => { try {
+app.post('/api/sales', auth, permitAny(['add-sale', 'passbook'], { write: true }), async (req, res, next) => { try {
   const row = saleFromBody(req.body)
   if (!row.customer_name || row.selling_price <= 0) return res.status(400).json({ error: 'Customer name and a valid selling price are required.' })
   row.id = await nextId('sales'); row.created_at = new Date().toISOString(); row.created_by = req.user.user
   await insert('sales', row); res.status(201).json(row)
 } catch (e) { next(e) } })
-app.put('/api/sales/:id', auth, async (req, res, next) => { try {
+app.put('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try {
   const id = Number(req.params.id), current = await one('sales', { id })
   if (!current) return res.status(404).json({ error: 'Transaction not found.' })
   const patch = saleFromBody({ ...current, ...req.body }); patch.updated_at = new Date().toISOString(); patch.updated_by = req.user.user
   await update('sales', { id }, patch); res.json({ ...current, ...patch })
 } catch (e) { next(e) } })
-app.delete('/api/sales/:id', auth, async (req, res, next) => { try { await remove('sales', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
-app.post('/api/sales/:id/payment', auth, async (req, res, next) => { try {
+app.delete('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try { await remove('sales', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
+app.post('/api/sales/:id/payment', auth, permit('review', { write: true }), async (req, res, next) => { try {
   const id = Number(req.params.id), row = await one('sales', { id })
   if (!row) return res.status(404).json({ error: 'Transaction not found.' })
   const amount = Math.max(0, Math.min(Number(req.body.amount || 0), Number(row.pending_amount || 0)))
@@ -238,22 +425,22 @@ app.post('/api/sales/:id/payment', auth, async (req, res, next) => { try {
   await update('sales', { id }, patch); res.json({ ...row, ...patch })
 } catch (e) { next(e) } })
 
-app.get('/api/inventory', auth, async (_req, res, next) => { try { res.json(await list('inventory')) } catch (e) { next(e) } })
-app.post('/api/inventory', auth, async (req, res, next) => { try {
+app.get('/api/inventory', auth, permitAny(['inventory', 'vendors', 'ai', 'technical']), async (_req, res, next) => { try { res.json(await list('inventory')) } catch (e) { next(e) } })
+app.post('/api/inventory', auth, permit('inventory', { write: true }), async (req, res, next) => { try {
   const id = Number(req.body.id || 0), existing = id ? await one('inventory', { id }) : null
   const row = { id: existing?.id || await nextId('inventory'), item: String(req.body.item || '').trim(), vendor: String(req.body.vendor || '').trim(), category: req.body.category || 'Other', quantity: Number(req.body.quantity || 0), reorder_level: Number(req.body.reorder_level || 0), cost_price: Number(req.body.cost_price || 0), selling_price: Number(req.body.selling_price || 0), updated_at: new Date().toISOString() }
   if (!row.item) return res.status(400).json({ error: 'Item name is required.' })
   existing ? await update('inventory', { id }, row) : await insert('inventory', row); res.json(row)
 } catch (e) { next(e) } })
-app.delete('/api/inventory/:id', auth, async (req, res, next) => { try { await remove('inventory', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
+app.delete('/api/inventory/:id', auth, permit('inventory', { write: true }), async (req, res, next) => { try { await remove('inventory', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
 
-app.get('/api/notes', auth, async (_req, res, next) => { try { const rows = await list('work_notes'); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
-app.post('/api/notes', auth, async (req, res, next) => { try { const row = { id: await nextId('work_notes'), work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
-app.delete('/api/notes/:id', auth, async (req, res, next) => { try { await remove('work_notes', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
+app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (_req, res, next) => { try { const rows = await list('work_notes'); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
+app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
+app.delete('/api/notes/:id', auth, permit('notes', { write: true }), async (req, res, next) => { try { await remove('work_notes', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
 
-app.get('/api/bills', auth, async (_req, res, next) => { try { res.json(await list('bill_history')) } catch (e) { next(e) } })
-app.post('/api/bills', auth, async (req, res, next) => { try { const row = { ...req.body, bill_id: `SKB-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String(await nextId('bills')).padStart(4,'0')}`, generated_at: new Date().toISOString(), generated_by: req.user.user }; await insert('bill_history', row); res.json(row) } catch (e) { next(e) } })
-app.post('/api/bills/generate', auth, async (req, res, next) => { try {
+app.get('/api/bills', auth, permit('bill'), async (_req, res, next) => { try { res.json(await list('bill_history')) } catch (e) { next(e) } })
+app.post('/api/bills', auth, permit('bill', { write: true }), async (req, res, next) => { try { const row = { ...req.body, bill_id: `SKB-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String(await nextId('bills')).padStart(4,'0')}`, generated_at: new Date().toISOString(), generated_by: req.user.user }; await insert('bill_history', row); res.json(row) } catch (e) { next(e) } })
+app.post('/api/bills/generate', auth, permit('bill', { write: true }), async (req, res, next) => { try {
   const customerName = String(req.body.customer_name || '').trim()
   const scope = ['All Transactions', 'Last Transactions', 'Pending Transactions'].includes(req.body.bill_scope) ? req.body.bill_scope : 'All Transactions'
   const limit = Math.max(1, Math.min(Number(req.body.bill_limit || 5), 100))
@@ -285,24 +472,24 @@ app.post('/api/bills/generate', auth, async (req, res, next) => { try {
   res.send(pdfBytes)
 } catch (e) { next(e) } })
 
-app.get('/api/devices', auth, async (_req, res, next) => { try { res.json(await list('auth_devices')) } catch (e) { next(e) } })
-app.patch('/api/devices/:id', auth, async (req, res, next) => { try { await update('auth_devices', { id: req.params.id }, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true }) } catch (e) { next(e) } })
+app.get('/api/devices', auth, permit('security', { adminOnly: true }), async (_req, res, next) => { try { res.json(await list('auth_devices')) } catch (e) { next(e) } })
+app.patch('/api/devices/:id', auth, permit('security', { adminOnly: true }), async (req, res, next) => { try { await update('auth_devices', { id: req.params.id }, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true }) } catch (e) { next(e) } })
 
-app.get('/api/settings', auth, async (_req, res, next) => { try { res.json((await one('app_settings', { id: 'global' })) || {}) } catch (e) { next(e) } })
-app.put('/api/settings', auth, async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const row = { ...old, ...req.body, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); res.json(row) } catch (e) { next(e) } })
+app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { res.json((await one('app_settings', { id: 'global' })) || {}) } catch (e) { next(e) } })
+app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const row = { ...old, ...req.body, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); res.json(row) } catch (e) { next(e) } })
 
-app.get('/api/backup', auth, async (_req, res, next) => { try { const data = {}; for (const name of collections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 3, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
-app.post('/api/restore', auth, async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of collections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })
+app.get('/api/backup', auth, permit('backup', { adminOnly: true }), async (_req, res, next) => { try { const data = {}; for (const name of backupCollections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 4, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
+app.post('/api/restore', auth, permit('backup', { adminOnly: true }), async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of backupCollections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })
 
-app.post('/api/passbook/parse', auth, upload.array('files', 10), async (req, res, next) => { try {
+app.post('/api/passbook/parse', auth, permit('passbook', { write: true }), upload.array('files', 10), async (req, res, next) => { try {
   if (!req.files?.length) return res.status(400).json({ error: 'Choose one or more PDF files.' })
   const files = req.files.map((file) => ({ filename: file.originalname, base64: file.buffer.toString('base64') }))
   res.json(await runPython('parse_passbooks', { files }, 90000, pythonRequestContext(req)))
 } catch (e) { next(e) } })
-app.get('/api/passbook/vendors', auth, async (_req, res, next) => { try {
+app.get('/api/passbook/vendors', auth, permit('passbook'), async (_req, res, next) => { try {
   const rows = await list('passbook_vendors'); res.json(rows.map((row) => row.name).filter(Boolean).sort((a, b) => a.localeCompare(b)))
 } catch (e) { next(e) } })
-app.post('/api/passbook/vendors', auth, async (req, res, next) => { try {
+app.post('/api/passbook/vendors', auth, permit('passbook', { write: true }), async (req, res, next) => { try {
   const name = String(req.body.name || '').replace(/\s+/g, ' ').trim(), key = name.toLocaleLowerCase()
   if (!name) return res.status(400).json({ error: 'Vendor name is required.' })
   const existing = await one('passbook_vendors', { key })
@@ -310,7 +497,7 @@ app.post('/api/passbook/vendors', auth, async (req, res, next) => { try {
   existing ? await update('passbook_vendors', { key }, row) : await insert('passbook_vendors', { ...row, created_at: new Date().toISOString() })
   res.json(row)
 } catch (e) { next(e) } })
-app.delete('/api/passbook/vendors/:name', auth, async (req, res, next) => { try {
+app.delete('/api/passbook/vendors/:name', auth, permit('passbook', { write: true }), async (req, res, next) => { try {
   await remove('passbook_vendors', { key: decodeURIComponent(req.params.name).toLocaleLowerCase() }); res.status(204).end()
 } catch (e) { next(e) } })
 
@@ -329,7 +516,7 @@ async function askAI(question, context) {
   }
   throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.')
 }
-app.post('/api/ai', auth, async (req, res, next) => { try {
+app.post('/api/ai', auth, permit('ai'), async (req, res, next) => { try {
   const sales = (await list('sales')).slice(-150), inventory = (await list('inventory')).slice(-100), notes = (await list('work_notes')).slice(-30)
   const context = JSON.stringify({ sales, inventory, notes }).slice(0, 80000)
   res.json({ answer: await askAI(String(req.body.question || ''), context) })

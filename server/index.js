@@ -297,11 +297,22 @@ function smtpTransport(settings) {
   })
 }
 
-async function sendConfiguredEmail({ to, subject, text, html }) {
+async function sendConfiguredEmail({ to, subject, text, html }, { allowDisabled = false } = {}) {
   const settings = await one('app_settings', { id: 'global' }), smtp = settings?.smtp
-  if (!smtp?.enabled) throw new Error('SMTP email sending is not enabled.')
+  if (!smtp?.enabled && !allowDisabled) throw new Error('SMTP email sending is not enabled.')
   const transporter = smtpTransport(smtp)
   return transporter.sendMail({ from: { name: smtp.from_name || 'Shree Krishna Boutique', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html })
+}
+
+function smtpErrorMessage(error) {
+  const message = readableError(error, 'SMTP connection failed.')
+  if (error?.code === 'EAUTH' || error?.responseCode === 535 || /535|BadCredentials|Username and Password not accepted/i.test(message)) {
+    return 'Gmail rejected the username or password. Use the complete Google email as the SMTP username and a current 16-character Google App Password, not the normal account password.'
+  }
+  if (['ETIMEDOUT', 'ESOCKET', 'ECONNECTION', 'ECONNREFUSED'].includes(error?.code) || /timed?\s*out|connection refused/i.test(message)) {
+    return 'The SMTP server could not be reached. Check the host, port and connection security, then try again.'
+  }
+  return message
 }
 
 function runPython(action, payload, timeoutMs = 90000, requestContext = {}) {
@@ -804,9 +815,9 @@ app.post('/api/smtp/test', auth, permit('technical', { adminOnly: true }), async
     to, subject: 'Shree Krishna Boutique SMTP test',
     text: `Your boutique SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
     html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Shree Krishna Boutique workspace can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
-  })
+  }, { allowDisabled: true })
   res.json({ ok: true, message_id: info.messageId || '', accepted: info.accepted || [] })
-} catch (e) { next(new Error(`SMTP test failed: ${readableError(e)}`)) } })
+} catch (e) { const message = smtpErrorMessage(e); console.error(`SMTP test failed: ${message}`); res.status(400).json({ error: message }) } })
 
 app.get('/api/backup', auth, permit('backup', { adminOnly: true }), async (_req, res, next) => { try { const data = {}; for (const name of backupCollections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 4, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
 app.post('/api/restore', auth, permit('backup', { adminOnly: true }), async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of backupCollections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })

@@ -34,7 +34,7 @@ SMTP_ENCRYPTION_KEY=...
 
 Keep the platform password and all other secrets in Vercel; never commit them. The account named by `USERNAME` is the only platform administrator. Its interface and API access are limited to the private **Customer accounts** console with registration details, workspace status, activity, record counts, revenue, pending value, login history, and estimated MongoDB document usage. Stale environment administrators are disabled automatically.
 
-When `BOUTIQUE_USERNAME` and `BOUTIQUE_NAME` are set, the server creates a separate owner workspace for the platform owner’s own boutique. It intentionally reuses the platform `PASSWORD` or `PASSWORD_HASH`, while receiving the standard business tools plus the private Technical and SMTP page. Public customer workspaces do not receive Technical access. Existing legacy business records assigned to the old platform workspace are migrated into this boutique automatically.
+When `BOUTIQUE_USERNAME` and `BOUTIQUE_NAME` are set, the server creates a separate owner workspace for the platform owner’s own boutique. It intentionally reuses the platform `PASSWORD` or `PASSWORD_HASH`, while receiving the standard business tools plus private Technical/SMTP, IAM, Security/PEM, and workspace Backup/Restore pages. Public customer workspaces do not receive these owner-only controls. Existing legacy business records assigned to the old platform workspace are migrated into this boutique automatically.
 
 Public password signups require contact, organisation, and location details. There is no approval queue: successful signup creates a workspace owner account immediately. Customer owners never see the platform console, internal IAM, security devices, SMTP credentials, or other workspaces.
 

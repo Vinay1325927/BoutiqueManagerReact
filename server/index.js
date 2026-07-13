@@ -29,7 +29,6 @@ let databasePromise = null
 
 const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors']
 const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets']
-const backupCollections = collections.filter((name) => !['auth_challenges', 'oauth_states', 'oauth_tickets'].includes(name))
 for (const name of collections) memory.set(name, [])
 
 async function connectDb() {
@@ -137,8 +136,8 @@ async function readTransient(name, id, match = {}) {
 }
 
 const OWNER_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
-const PERSONAL_BOUTIQUE_FEATURES = [...OWNER_FEATURES, 'technical']
-const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'backup', 'platform']
+const PERSONAL_BOUTIQUE_FEATURES = [...OWNER_FEATURES, 'technical', 'iam', 'security', 'backup']
+const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
 const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
@@ -754,13 +753,12 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json(publicUser(user))
 })
 
-app.get('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
-  await ensureEnvironmentAdmin()
-  const users = (await list('iam_users')).filter((user) => user.source !== 'signup')
+app.get('/api/iam/users', auth, permit('iam'), async (req, res, next) => { try {
+  const users = await list('iam_users', workspaceQuery(req))
   users.sort((a, b) => String(a.username).localeCompare(String(b.username)))
   res.json(users.map(publicUser))
 } catch (e) { next(e) } })
-app.post('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+app.post('/api/iam/users', auth, permit('iam', { write: true }), async (req, res, next) => { try {
   const username = String(req.body.username || '').trim(), key = usernameKey(username), password = String(req.body.password || '')
   const email = String(req.body.email || '').trim().toLocaleLowerCase()
   const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
@@ -771,14 +769,14 @@ app.post('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (req,
   if (await one('iam_users', { username_key: key })) return res.status(409).json({ error: 'That username already exists.' })
   if (email && (await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
   const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : VIEWER_FEATURES
-  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', workspace_id: 'platform', platform_admin: false, password_hash: await bcrypt.hash(password, 12), profile: email ? { email, email_key: email } : {}, created_at: now(), created_by: req.user.user, updated_at: now() }
+  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', workspace_id: req.user.workspace_id, platform_admin: false, password_hash: await bcrypt.hash(password, 12), profile: email ? { email, email_key: email } : {}, created_at: now(), created_by: req.user.user, updated_at: now() }
   await insert('iam_users', row)
   res.status(201).json(publicUser(row))
 } catch (e) { next(e) } })
-app.patch('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const user = await one('iam_users', { id: req.params.id })
+app.patch('/api/iam/users/:id', auth, permit('iam', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
-  if (user.source === 'environment') return res.status(400).json({ error: 'The environment administrator is managed through Vercel environment variables.' })
+  if (user.source === 'personal_boutique') return res.status(400).json({ error: 'The workspace owner account is managed through server configuration.' })
   const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : (user.role === 'admin' ? 'custom' : user.role)
   const active = req.body.active === undefined ? user.active !== false : Boolean(req.body.active)
   const email = req.body.email === undefined ? String(user.profile?.email || '') : String(req.body.email || '').trim().toLocaleLowerCase()
@@ -790,17 +788,17 @@ app.patch('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async 
     if (String(req.body.password).length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
     patch.password_hash = await bcrypt.hash(String(req.body.password), 12)
   }
-  await update('iam_users', { id: user.id }, patch)
+  await update('iam_users', query, patch)
   res.json(publicUser({ ...user, ...patch }))
 } catch (e) { next(e) } })
-app.delete('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const user = await one('iam_users', { id: req.params.id })
+app.delete('/api/iam/users/:id', auth, permit('iam', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
-  if (user.source === 'environment' || user.id === req.user.user_id) return res.status(400).json({ error: 'This administrator account cannot be deleted.' })
-  await remove('iam_users', { id: user.id }); res.status(204).end()
+  if (user.source === 'personal_boutique' || user.id === req.user.user_id) return res.status(400).json({ error: 'The workspace owner account cannot be deleted.' })
+  await remove('iam_users', query); res.status(204).end()
 } catch (e) { next(e) } })
-app.put('/api/iam/users/:id/pem', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const user = await one('iam_users', { id: req.params.id })
+app.put('/api/iam/users/:id/pem', auth, permit('iam', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
   const pem = String(req.body.pem || '').trim()
   if (!pem.includes('BEGIN PUBLIC KEY') && !pem.includes('BEGIN CERTIFICATE')) return res.status(400).json({ error: 'Upload a public PEM key or certificate. Private keys must stay on the user’s device.' })
@@ -812,14 +810,14 @@ app.put('/api/iam/users/:id/pem', auth, permit('iam', { adminOnly: true }), asyn
     der = key.export({ type: 'spki', format: 'der' })
   } catch (error) { return res.status(400).json({ error: error.message || 'The public PEM file is invalid.' }) }
   const patch = { pem_public_key: canonical, pem_fingerprint: createHash('sha256').update(der).digest('hex').match(/.{1,2}/g).join(':'), pem_filename: String(req.body.filename || 'public-key.pem').slice(0, 160), pem_enrolled_at: now(), pem_enrolled_by: req.user.user, updated_at: now() }
-  await update('iam_users', { id: user.id }, patch)
+  await update('iam_users', query, patch)
   res.json(publicUser({ ...user, ...patch }))
 } catch (e) { next(e) } })
-app.delete('/api/iam/users/:id/pem', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const user = await one('iam_users', { id: req.params.id })
+app.delete('/api/iam/users/:id/pem', auth, permit('iam', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
   const patch = { pem_public_key: '', pem_fingerprint: '', pem_filename: '', pem_enrolled_at: '', pem_enrolled_by: '', updated_at: now() }
-  await update('iam_users', { id: user.id }, patch)
+  await update('iam_users', query, patch)
   res.json(publicUser({ ...user, ...patch }))
 } catch (e) { next(e) } })
 
@@ -901,8 +899,12 @@ app.post('/api/bills/generate', auth, permit('bill', { write: true }), async (re
   res.send(pdfBytes)
 } catch (e) { next(e) } })
 
-app.get('/api/devices', auth, permit('security', { adminOnly: true }), async (_req, res, next) => { try { res.json(await list('auth_devices')) } catch (e) { next(e) } })
-app.patch('/api/devices/:id', auth, permit('security', { adminOnly: true }), async (req, res, next) => { try { await update('auth_devices', { id: req.params.id }, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true }) } catch (e) { next(e) } })
+app.get('/api/devices', auth, permit('security'), async (req, res, next) => { try { res.json(await list('auth_devices', workspaceQuery(req))) } catch (e) { next(e) } })
+app.patch('/api/devices/:id', auth, permit('security', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), device = await one('auth_devices', query)
+  if (!device) return res.status(404).json({ error: 'Device session not found.' })
+  await update('auth_devices', query, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true })
+} catch (e) { next(e) } })
 
 app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { const row = (await one('app_settings', { id: 'global' })) || {}; const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
 app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const { smtp: _ignoredSmtp, ...input } = req.body || {}; const row = { ...old, ...input, smtp: old?.smtp, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
@@ -975,8 +977,17 @@ app.patch('/api/platform/customers/:id', auth, platformOnly, async (req, res, ne
   res.json({ ...workspace, ...patch })
 } catch (e) { next(e) } })
 
-app.get('/api/backup', auth, permit('backup', { adminOnly: true }), async (_req, res, next) => { try { const data = {}; for (const name of backupCollections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 4, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
-app.post('/api/restore', auth, permit('backup', { adminOnly: true }), async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of backupCollections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })
+app.get('/api/backup', auth, permit('backup'), async (req, res, next) => { try {
+  const data = {}; for (const name of BUSINESS_COLLECTIONS) data[name] = await list(name, workspaceQuery(req))
+  const workspace = await one('workspaces', { id: req.user.workspace_id })
+  res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`)
+  res.json({ version: 5, created_at: new Date().toISOString(), workspace: { id: req.user.workspace_id, name: workspace?.name || req.user.user }, data })
+} catch (e) { next(e) } })
+app.post('/api/restore', auth, permit('backup', { write: true }), async (req, res, next) => { try {
+  const data = req.body.data || {}; let inserted = 0
+  for (const name of BUSINESS_COLLECTIONS) for (const row of (data[name] || [])) { await insert(name, { ...clean(row), workspace_id: req.user.workspace_id }); inserted++ }
+  res.json({ inserted })
+} catch (e) { next(e) } })
 
 app.post('/api/passbook/parse', auth, permit('passbook', { write: true }), upload.array('files', 10), async (req, res, next) => { try {
   if (!req.files?.length) return res.status(400).json({ error: 'Choose one or more PDF files.' })

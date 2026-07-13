@@ -214,6 +214,8 @@ def generate_bill(payload):
     bill_date = payload.get("bill_date") or str(date.today())
     scope_label = payload.get("bill_scope_label") or "All Transactions"
     business_name = clean(payload.get("business_name")) or "Boutique Cloud"
+    business_logo = clean(payload.get("business_logo"))
+    store_credit = max(0, amount(payload.get("store_credit")))
     upi_id = clean(payload.get("upi_id"))
     total_bill = sum(amount(row.get("selling_price")) for row in rows)
     total_paid = sum(amount(row.get("amount_paid")) for row in rows)
@@ -230,6 +232,11 @@ def generate_bill(payload):
     story = []
     initials = "".join(word[0] for word in business_name.split()[:2]).upper() or "BC"
     symbol = Paragraph(f"<b>{html_escape(initials)}</b>", center_style)
+    if business_logo.startswith("data:image/") and ";base64," in business_logo:
+        try:
+            symbol = Image(io.BytesIO(base64.b64decode(business_logo.split(",", 1)[1])), width=20*mm, height=20*mm, kind="proportional")
+        except Exception:
+            pass
     brand = Table([[symbol, [Paragraph(html_escape(business_name), title_style), Paragraph("Customer Purchase Bill", sub_style)]]], colWidths=[24*mm, 88*mm])
     brand.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0)]))
     header_details = [Paragraph(f"<b>Bill ID:</b> {html_escape(bill_id)}",right_style),Paragraph(f"<b>Bill Date:</b> {display_date(bill_date)}",right_style)]
@@ -253,9 +260,9 @@ def generate_bill(payload):
     story.extend([purchase_table,Spacer(1,10)])
     if upi_id:
         payment_block = [Image(upi_qr(total_pending, upi_id, business_name),width=34*mm,height=34*mm),[Paragraph("<b>UPI Payment</b>",sub_style),Paragraph(f"UPI ID: {html_escape(upi_id)}",sub_style),Paragraph(f"QR amount: Rs {total_pending:,.2f}" if total_pending>0 else "No pending amount",sub_style)]]
-        totals = Table([[*payment_block,[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style)]]],colWidths=[38*mm,62*mm,68*mm])
+        totals = Table([[*payment_block,[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style),Paragraph(f"<b>Store Credit:</b> Rs {store_credit:,.2f}",right_style)]]],colWidths=[38*mm,62*mm,68*mm])
     else:
-        totals = Table([[Paragraph("Payment summary",sub_style),[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style)]]],colWidths=[100*mm,68*mm])
+        totals = Table([[Paragraph("Payment summary",sub_style),[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style),Paragraph(f"<b>Store Credit:</b> Rs {store_credit:,.2f}",right_style)]]],colWidths=[100*mm,68*mm])
     totals.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.7,colors.HexColor("#CBD5E1")),("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F8FAFC")),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("PADDING",(0,0),(-1,-1),8)]))
     story.extend([totals,Spacer(1,8)])
     if total_pending>0:
@@ -263,7 +270,7 @@ def generate_bill(payload):
     else:
         story.append(Paragraph("All listed purchases are paid.",ParagraphStyle("Paid",parent=center_style,fontSize=10,textColor=colors.HexColor("#047857"))))
     document.build(story)
-    return {"pdf_base64": base64.b64encode(output.getvalue()).decode(),"total_bill":total_bill,"total_paid":total_paid,"total_pending":total_pending,"customer_phone":phone}
+    return {"pdf_base64": base64.b64encode(output.getvalue()).decode(),"total_bill":total_bill,"total_paid":total_paid,"total_pending":total_pending,"store_credit":store_credit,"customer_phone":phone}
 
 
 def main():

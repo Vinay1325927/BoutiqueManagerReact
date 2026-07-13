@@ -27,8 +27,8 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors']
-const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets']
+const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits']
+const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets', 'backup_deliveries']
 for (const name of collections) memory.set(name, [])
 
 async function connectDb() {
@@ -135,8 +135,9 @@ async function readTransient(name, id, match = {}) {
   return clean(row)
 }
 
-const OWNER_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
-const PERSONAL_BOUTIQUE_FEATURES = [...OWNER_FEATURES, 'technical', 'iam', 'security', 'backup']
+const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
+const OWNER_FEATURES = [...BUSINESS_FEATURES, 'iam', 'security', 'smtp', 'technical', 'backup', 'settings']
+const PERSONAL_BOUTIQUE_FEATURES = OWNER_FEATURES
 const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
 const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
@@ -411,11 +412,26 @@ function smtpTransport(settings) {
   })
 }
 
-async function sendConfiguredEmail({ to, subject, text, html }, { allowDisabled = false } = {}) {
-  const settings = await one('app_settings', { id: 'global' }), smtp = settings?.smtp
+async function sendConfiguredEmail({ to, subject, text, html, attachments }, { allowDisabled = false, workspaceId = 'global' } = {}) {
+  const settings = await one('app_settings', { id: workspaceId === 'global' ? 'global' : `workspace:${workspaceId}` }), smtp = settings?.smtp
   if (!smtp?.enabled && !allowDisabled) throw new Error('SMTP email sending is not enabled.')
   const transporter = smtpTransport(smtp)
-  return transporter.sendMail({ from: { name: smtp.from_name || 'Boutique Cloud', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html })
+  return transporter.sendMail({ from: { name: smtp.from_name || 'Boutique Cloud', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html, attachments })
+}
+
+function otpCode() { return String(Math.floor(100000 + Math.random() * 900000)) }
+async function createEmailOtp(email, purpose, metadata = {}) {
+  const code = otpCode(), row = { id: randomUUID(), purpose, email: usernameKey(email), code_hash: await bcrypt.hash(code, 10), metadata: clean(metadata), used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
+  await insert('auth_challenges', row)
+  await sendConfiguredEmail({ to: email, subject: `Boutique Cloud verification code: ${code}`, text: `Your Boutique Cloud verification code is ${code}. It expires in 10 minutes.`, html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">Verify your email</h2><p>Use this one-time code:</p><p style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request it, ignore this email.</p></div>` })
+  return row.id
+}
+async function verifyEmailOtp(email, purpose, code) {
+  const rows = (await list('auth_challenges')).filter((row) => row.purpose === purpose && row.email === usernameKey(email) && !row.used && row.expires_at > now()).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
+  const row = rows[0]
+  if (!row || !(await bcrypt.compare(String(code || ''), row.code_hash))) return false
+  await update('auth_challenges', { id: row.id }, { used: true, used_at: now() })
+  return true
 }
 
 function smtpErrorMessage(error) {
@@ -594,6 +610,7 @@ function signupInput(body, passwordRequired) {
     website: String(body.website || '').trim().slice(0, 250),
     city: String(body.city || '').trim().slice(0, 100), state: String(body.state || '').trim().slice(0, 100), country: String(body.country || '').trim().slice(0, 100),
     requested_username: String(body.requested_username || '').trim(), use_case: String(body.use_case || '').trim().slice(0, 1500), how_heard: String(body.how_heard || '').trim().slice(0, 200),
+    logo: String(body.logo || '').trim(),
   }
   const password = String(body.password || ''), confirmPassword = String(body.confirm_password || '')
   if (!data.full_name || !data.organization_name || !data.organization_type || !data.city || !data.state || !data.country) return { error: 'Complete all required contact and organisation details.' }
@@ -602,6 +619,7 @@ function signupInput(body, passwordRequired) {
   if (phoneDigits.length < 7 || phoneDigits.length > 16) return { error: 'Enter a valid phone number.' }
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(data.requested_username)) return { error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' }
   if (body.terms !== true) return { error: 'Confirm the registration information and access terms.' }
+  if (data.logo && (!/^data:image\/(png|jpeg|webp);base64,/i.test(data.logo) || data.logo.length > 1400000)) return { error: 'Upload a PNG, JPEG or WebP logo smaller than 1 MB.' }
   if (passwordRequired && (password.length < 8 || password !== confirmPassword)) return { error: password !== confirmPassword ? 'Passwords do not match.' : 'Use a password with at least 8 characters.' }
   return { data: { ...data, email_key: data.email, username_key: usernameKey(data.requested_username) }, password }
 }
@@ -622,7 +640,7 @@ async function createWorkspaceAccount(req, { data, password = '', identity = nul
   const profile = {
     full_name: data.full_name, email: data.email, email_key: data.email_key, phone: data.phone, organization_name: data.organization_name,
     organization_type: data.organization_type, job_title: data.job_title, team_size: data.team_size, website: data.website,
-    city: data.city, state: data.state, country: data.country, use_case: data.use_case, how_heard: data.how_heard, picture: identity?.picture || '',
+    city: data.city, state: data.state, country: data.country, use_case: data.use_case, how_heard: data.how_heard, picture: identity?.picture || '', logo: data.logo || '',
   }
   const workspace = {
     id: workspaceId, name: workspaceName(profile, data.requested_username), active: true, plan: 'free', owner_user_id: userId,
@@ -634,8 +652,9 @@ async function createWorkspaceAccount(req, { data, password = '', identity = nul
     auth_providers: identity ? [{ provider: identity.provider, subject: identity.subject, email: identity.email, linked_at: createdAt }] : [],
     created_at: createdAt, created_by: 'self_signup', updated_at: createdAt,
   }
+  const { logo: _logo, ...signupData } = data
   const signup = {
-    id: randomUUID(), ...data, workspace_id: workspaceId, iam_user_id: userId, signup_method: signupMethod, status: 'active', terms_accepted: true,
+    id: randomUUID(), ...signupData, workspace_id: workspaceId, iam_user_id: userId, signup_method: signupMethod, status: 'active', terms_accepted: true,
     oauth_provider: identity?.provider || '', oauth_subject: identity?.subject || '', verified_at: identity ? createdAt : '',
     created_at: createdAt, activated_at: createdAt, updated_at: createdAt, user_agent: req.headers['user-agent'] || '',
   }
@@ -646,12 +665,38 @@ async function createWorkspaceAccount(req, { data, password = '', identity = nul
   return { workspace, user, signup, device, token: sign(user, device.id) }
 }
 
+app.post('/api/auth/signup/otp', async (req, res, next) => { try {
+  const email = String(req.body.email || '').trim().toLocaleLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid business email address.' })
+  const users = await list('iam_users')
+  if (users.some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === email)) return res.status(409).json({ error: 'An account already exists for this email. Please log in.' })
+  await createEmailOtp(email, 'signup')
+  res.json({ ok: true, message: 'Verification code sent. It expires in 10 minutes.' })
+} catch (e) { next(e) } })
+
 app.post('/api/auth/signup', async (req, res, next) => { try {
   const parsed = signupInput(req.body, true)
   if (parsed.error) return res.status(400).json({ error: parsed.error })
+  if (!(await verifyEmailOtp(parsed.data.email, 'signup', req.body.otp))) return res.status(400).json({ error: 'Enter the valid email verification code.' })
   const result = await createWorkspaceAccount(req, { data: parsed.data, password: parsed.password })
   if (result.error) return res.status(400).json({ error: result.error })
   res.status(201).json({ ok: true, token: result.token, user: publicUser(result.user), workspace: result.workspace, message: 'Your private workspace is ready.' })
+} catch (e) { next(e) } })
+
+app.post('/api/auth/forgot-password/otp', async (req, res, next) => { try {
+  const email = String(req.body.email || '').trim().toLocaleLowerCase(), users = await list('iam_users')
+  const user = users.find((row) => usernameKey(row.profile?.email || row.profile?.email_key) === email && row.active !== false)
+  if (user && user.source !== 'environment') await createEmailOtp(email, 'password_reset', { user_id: user.id })
+  res.json({ ok: true, message: 'If that email belongs to an active account, a verification code has been sent.' })
+} catch (e) { next(e) } })
+
+app.post('/api/auth/forgot-password/reset', async (req, res, next) => { try {
+  const email = String(req.body.email || '').trim().toLocaleLowerCase(), password = String(req.body.password || '')
+  if (password.length < 8 || password !== String(req.body.confirm_password || '')) return res.status(400).json({ error: 'Passwords must match and contain at least 8 characters.' })
+  const users = await list('iam_users'), user = users.find((row) => usernameKey(row.profile?.email || row.profile?.email_key) === email && row.active !== false && row.source !== 'environment')
+  if (!user || !(await verifyEmailOtp(email, 'password_reset', req.body.otp))) return res.status(400).json({ error: 'The reset code is invalid or expired.' })
+  await update('iam_users', { id: user.id }, { password_hash: await bcrypt.hash(password, 12), updated_at: now(), password_reset_at: now() })
+  res.json({ ok: true, message: 'Password updated. You can now sign in.' })
 } catch (e) { next(e) } })
 app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
   const settings = oauthSettings(req.params.provider, req)
@@ -776,7 +821,7 @@ app.post('/api/iam/users', auth, permit('iam', { write: true }), async (req, res
 app.patch('/api/iam/users/:id', auth, permit('iam', { write: true }), async (req, res, next) => { try {
   const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
-  if (user.source === 'personal_boutique') return res.status(400).json({ error: 'The workspace owner account is managed through server configuration.' })
+  if (user.role === 'owner' || user.source === 'personal_boutique') return res.status(400).json({ error: 'The workspace owner account is protected. Update its profile in Settings.' })
   const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : (user.role === 'admin' ? 'custom' : user.role)
   const active = req.body.active === undefined ? user.active !== false : Boolean(req.body.active)
   const email = req.body.email === undefined ? String(user.profile?.email || '') : String(req.body.email || '').trim().toLocaleLowerCase()
@@ -827,7 +872,7 @@ function saleFromBody(body) {
     customer_name: String(body.customer_name || '').trim(), customer_phone: String(body.customer_phone || '').trim(),
     sale_date: body.sale_date || new Date().toISOString().slice(0, 10), vendor: String(body.vendor || '').trim(),
     product_category: body.product_category || 'Other', product_description: String(body.product_description || '').trim(),
-    buying_price: buying, selling_price: selling, amount_paid: Math.min(paid, selling), pending_amount: Math.max(0, selling - paid),
+    buying_price: buying, selling_price: selling, amount_paid: Math.min(paid, selling), pending_amount: Math.max(0, selling - paid), store_credit_generated: Math.max(0, paid - selling),
     payment_received: paid >= selling ? 1 : 0, delay_status: body.delay_status ? 1 : 0,
     payment_method: body.payment_method || 'UPI', notes: String(body.notes || '').trim(),
     quantity: Math.max(1, Number(body.quantity || 1)),
@@ -841,7 +886,9 @@ app.post('/api/sales', auth, permitAny(['add-sale', 'passbook'], { write: true }
   const row = saleFromBody(req.body)
   if (!row.customer_name || row.selling_price <= 0) return res.status(400).json({ error: 'Customer name and a valid selling price are required.' })
   row.id = await nextId('sales'); row.workspace_id = req.user.workspace_id; row.created_at = new Date().toISOString(); row.created_by = req.user.user
-  await insert('sales', row); res.status(201).json(row)
+  await insert('sales', row)
+  if (row.store_credit_generated > 0) await insert('customer_credits', { id:randomUUID(), workspace_id:req.user.workspace_id, customer_key:usernameKey(row.customer_name), customer_name:row.customer_name, customer_phone:row.customer_phone, amount:row.store_credit_generated, type:'credit', source_sale_id:row.id, created_at:now(), created_by:req.user.user })
+  res.status(201).json(row)
 } catch (e) { next(e) } })
 app.put('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try {
   const id = Number(req.params.id), query = workspaceQuery(req, { id }), current = await one('sales', query)
@@ -853,12 +900,20 @@ app.delete('/api/sales/:id', auth, permit('update', { write: true }), async (req
 app.post('/api/sales/:id/payment', auth, permit('review', { write: true }), async (req, res, next) => { try {
   const id = Number(req.params.id), query = workspaceQuery(req, { id }), row = await one('sales', query)
   if (!row) return res.status(404).json({ error: 'Transaction not found.' })
-  const amount = Math.max(0, Math.min(Number(req.body.amount || 0), Number(row.pending_amount || 0)))
+  const received = Math.max(0, Number(req.body.amount || 0)), amount = Math.min(received, Number(row.pending_amount || 0)), credit = Math.max(0, received - amount)
   if (!amount) return res.status(400).json({ error: 'Enter a valid collection amount.' })
   const paid = Number(row.amount_paid || 0) + amount, pending = Math.max(0, Number(row.selling_price || 0) - paid)
   const patch = { amount_paid: paid, pending_amount: pending, payment_received: pending <= 0 ? 1 : 0, last_payment_date: req.body.date || new Date().toISOString().slice(0, 10), last_payment_method: req.body.method || 'UPI', last_payment_received_by: req.body.received_by || req.user.user, updated_at: new Date().toISOString() }
-  await update('sales', query, patch); res.json({ ...row, ...patch })
+  await update('sales', query, patch)
+  if (credit > 0) await insert('customer_credits', { id:randomUUID(), workspace_id:req.user.workspace_id, customer_key:usernameKey(row.customer_name), customer_name:row.customer_name, customer_phone:row.customer_phone, amount:credit, type:'credit', source_sale_id:row.id, created_at:now(), created_by:req.user.user })
+  res.json({ ...row, ...patch, store_credit_added:credit })
 } catch (e) { next(e) } })
+
+app.get('/api/customer-credits', auth, permitAny(['dashboard','add-sale','review','customers','bill']), async (req,res,next)=>{try{
+  const rows=await list('customer_credits',workspaceQuery(req)), balances={}
+  for(const row of rows) balances[row.customer_key]=(balances[row.customer_key]||0)+(row.type==='debit'?-1:1)*Number(row.amount||0)
+  res.json({rows,balances})
+}catch(e){next(e)}})
 
 app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (req, res, next) => { try { const rows = await list('work_notes', workspaceQuery(req)); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
 app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), workspace_id: req.user.workspace_id, work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
@@ -880,13 +935,14 @@ app.post('/api/bills/generate', auth, permit('bill', { write: true }), async (re
   const billId = `BC-${dayKey}-${String(await nextId(`bill_${dayKey}`)).padStart(4, '0')}`
   const scopeLabel = scope === 'Last Transactions' ? `Last ${limit} Transactions` : scope
   const workspace = await one('workspaces', { id: req.user.workspace_id })
-  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel, business_name: workspace?.name || req.user.username }, 90000, pythonRequestContext(req))
+  const credits = await list('customer_credits', workspaceQuery(req, { customer_key: usernameKey(customerName) })), storeCredit = credits.reduce((sum,row)=>sum+(row.type==='debit'?-1:1)*Number(row.amount||0),0)
+  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel, business_name: workspace?.name || req.user.username, business_logo: workspace?.profile?.logo || '', store_credit: Math.max(0,storeCredit) }, 90000, pythonRequestContext(req))
   const history = {
     bill_id: billId, bill_date: billDate, customer_name: customerName, customer_phone: generated.customer_phone,
     bill_scope: scope, bill_limit: scope === 'Last Transactions' ? limit : null, bill_scope_label: scopeLabel,
     purchase_count: rows.length, purchase_ids: rows.map((row) => Number(row.id)),
     items: rows.map((row) => ({ sale_id: Number(row.id), sale_date: row.sale_date, category: row.product_category || '', description: row.product_description || '', bill_amount: Number(row.selling_price || 0), paid_amount: Number(row.amount_paid || 0), pending_amount: Number(row.pending_amount || 0), paid_date: row.last_payment_date || row.payment_date || '-', status: Number(row.pending_amount || 0) <= 0 ? 'PAID [x]' : 'PENDING' })),
-    total_bill: generated.total_bill, total_paid: generated.total_paid, total_pending: generated.total_pending,
+    total_bill: generated.total_bill, total_paid: generated.total_paid, total_pending: generated.total_pending, store_credit: generated.store_credit || 0,
     workspace_id: req.user.workspace_id, business_name: workspace?.name || req.user.username, upi_id: '', generated_at: new Date().toISOString(), generated_by: req.user.user,
   }
   await insert('bill_history', history)
@@ -906,29 +962,51 @@ app.patch('/api/devices/:id', auth, permit('security', { write: true }), async (
   await update('auth_devices', query, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true })
 } catch (e) { next(e) } })
 
-app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { const row = (await one('app_settings', { id: 'global' })) || {}; const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
-app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const { smtp: _ignoredSmtp, ...input } = req.body || {}; const row = { ...old, ...input, smtp: old?.smtp, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
+app.get('/api/settings', auth, permit('settings'), async (req, res, next) => { try {
+  const workspace = await one('workspaces', { id: req.user.workspace_id }), owner = await one('iam_users', { id: workspace?.owner_user_id })
+  res.json({ profile: workspace?.profile || owner?.profile || {}, username: owner?.username || req.user.username, workspace_name: workspace?.name || req.user.user, backup_schedule: workspace?.backup_schedule || {} })
+} catch (e) { next(e) } })
+app.put('/api/settings', auth, permit('settings', { write: true }), async (req, res, next) => { try {
+  const workspace = await one('workspaces', { id: req.user.workspace_id })
+  if (!workspace) return res.status(404).json({ error: 'Workspace not found.' })
+  const requestedUsername=String(req.body.username||req.body.profile?.requested_username||req.user.username).trim(), parsed = signupInput({ ...(workspace.profile || {}), ...(req.body.profile || {}), requested_username: requestedUsername, password: 'not-used', confirm_password: 'not-used', terms: true }, false)
+  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const users=await list('iam_users'), reserved=usernameKey(process.env.USERNAME||'Admin')
+  if (parsed.data.username_key===reserved||parsed.data.username_key==='admin'||users.some(row=>row.id!==workspace.owner_user_id&&row.username_key===parsed.data.username_key)) return res.status(409).json({error:'That preferred username is already in use or reserved.'})
+  if(users.some(row=>row.id!==workspace.owner_user_id&&usernameKey(row.profile?.email||row.profile?.email_key)===parsed.data.email_key)) return res.status(409).json({error:'That business email is already linked to another account.'})
+  const profile = { ...(workspace.profile || {}), ...parsed.data, requested_username: undefined, username_key: undefined, email_key: parsed.data.email }
+  const patch = { name: workspaceName(profile, req.user.username), profile, updated_at: now(), updated_by: req.user.user }
+  await update('workspaces', { id: workspace.id }, patch)
+  await update('iam_users', { id: workspace.owner_user_id }, { username:requestedUsername, username_key:parsed.data.username_key, profile, updated_at: now() })
+  res.json({ profile, username:requestedUsername, workspace_name: patch.name, backup_schedule: workspace.backup_schedule || {} })
+} catch (e) { next(e) } })
+app.post('/api/settings/password', auth, permit('settings', { write: true }), async (req,res,next)=>{try{
+  const user=await one('iam_users',{id:req.user.user_id}),password=String(req.body.password||''),confirm=String(req.body.confirm_password||'')
+  if(password.length<8||password!==confirm)return res.status(400).json({error:'New passwords must match and contain at least 8 characters.'})
+  if(user?.password_hash&&!(await bcrypt.compare(String(req.body.current_password||''),user.password_hash)))return res.status(400).json({error:'Current password is incorrect.'})
+  await update('iam_users',{id:user.id},{password_hash:await bcrypt.hash(password,12),password_changed_at:now(),updated_at:now()});res.json({ok:true})
+}catch(e){next(e)}})
 
-app.get('/api/smtp', auth, permit('technical'), async (_req, res, next) => { try {
-  const settings = await one('app_settings', { id: 'global' })
+app.get('/api/smtp', auth, permit('smtp'), async (req, res, next) => { try {
+  const settings = await one('app_settings', { id: `workspace:${req.user.workspace_id}` })
   res.json(publicSmtp(settings?.smtp))
 } catch (e) { next(e) } })
-app.put('/api/smtp', auth, permit('technical', { write: true }), async (req, res, next) => { try {
-  const settings = await one('app_settings', { id: 'global' }), parsed = smtpInput(req.body || {}, settings?.smtp || {})
+app.put('/api/smtp', auth, permit('smtp', { write: true }), async (req, res, next) => { try {
+  const id = `workspace:${req.user.workspace_id}`, settings = await one('app_settings', { id }), parsed = smtpInput(req.body || {}, settings?.smtp || {})
   if (parsed.error) return res.status(400).json({ error: parsed.error })
   const smtp = { ...parsed.value, updated_at: now(), updated_by: req.user.user }
-  if (settings) await update('app_settings', { id: 'global' }, { smtp, updated_at: now(), updated_by: req.user.user })
-  else await insert('app_settings', { id: 'global', smtp, updated_at: now(), updated_by: req.user.user })
+  if (settings) await update('app_settings', { id }, { smtp, updated_at: now(), updated_by: req.user.user })
+  else await insert('app_settings', { id, workspace_id: req.user.workspace_id, smtp, updated_at: now(), updated_by: req.user.user })
   res.json(publicSmtp(smtp))
 } catch (e) { next(e) } })
-app.post('/api/smtp/test', auth, permit('technical', { write: true }), async (req, res, next) => { try {
+app.post('/api/smtp/test', auth, permit('smtp', { write: true }), async (req, res, next) => { try {
   const to = String(req.body.to || '').trim().toLocaleLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Enter a valid test recipient email address.' })
   const info = await sendConfiguredEmail({
     to, subject: 'Boutique Cloud SMTP test',
     text: `Your platform SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
     html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Boutique Cloud platform can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
-  }, { allowDisabled: true })
+  }, { allowDisabled: true, workspaceId: req.user.workspace_id })
   res.json({ ok: true, message_id: info.messageId || '', accepted: info.accepted || [] })
 } catch (e) { const message = smtpErrorMessage(e); console.error(`SMTP test failed: ${message}`); res.status(400).json({ error: message }) } })
 
@@ -981,13 +1059,51 @@ app.get('/api/backup', auth, permit('backup'), async (req, res, next) => { try {
   const data = {}; for (const name of BUSINESS_COLLECTIONS) data[name] = await list(name, workspaceQuery(req))
   const workspace = await one('workspaces', { id: req.user.workspace_id })
   res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`)
-  res.json({ version: 5, created_at: new Date().toISOString(), workspace: { id: req.user.workspace_id, name: workspace?.name || req.user.user }, data })
+  res.json({ version: 6, created_at: new Date().toISOString(), workspace: { id: req.user.workspace_id, name: workspace?.name || req.user.user }, data })
 } catch (e) { next(e) } })
 app.post('/api/restore', auth, permit('backup', { write: true }), async (req, res, next) => { try {
-  const data = req.body.data || {}; let inserted = 0
-  for (const name of BUSINESS_COLLECTIONS) for (const row of (data[name] || [])) { await insert(name, { ...clean(row), workspace_id: req.user.workspace_id }); inserted++ }
-  res.json({ inserted })
+  const data = req.body.data || {}; let inserted = 0, skipped = 0
+  for (const name of BUSINESS_COLLECTIONS) for (const source of (data[name] || [])) {
+    const row = { ...clean(source), workspace_id: req.user.workspace_id }, query = row.id !== undefined ? workspaceQuery(req, { id: row.id }) : row.bill_id ? workspaceQuery(req, { bill_id: row.bill_id }) : row.key ? workspaceQuery(req, { key: row.key }) : workspaceQuery(req, { restore_hash: createHash('sha256').update(JSON.stringify(source)).digest('hex') })
+    if (await one(name, query)) { skipped++; continue }
+    if (!row.id && !row.bill_id && !row.key) row.restore_hash = query.restore_hash
+    await insert(name, row); inserted++
+  }
+  res.json({ inserted, skipped })
 } catch (e) { next(e) } })
+
+async function workspaceBackup(workspaceId) {
+  const data = {}; for (const name of BUSINESS_COLLECTIONS) data[name] = await list(name, { workspace_id: workspaceId })
+  const workspace = await one('workspaces', { id: workspaceId })
+  return { version: 6, created_at: now(), workspace: { id: workspaceId, name: workspace?.name || 'Business workspace' }, data }
+}
+
+app.get('/api/backup/schedule', auth, permit('backup'), async (req, res, next) => { try {
+  const workspace = await one('workspaces', { id: req.user.workspace_id }); res.json(workspace?.backup_schedule || { enabled:false, interval_hours:24, email:'', only_if_changed:true })
+} catch (e) { next(e) } })
+app.put('/api/backup/schedule', auth, permit('backup', { write: true }), async (req, res, next) => { try {
+  const email = String(req.body.email || '').trim().toLocaleLowerCase(), interval = Math.max(24, Math.min(720, Number(req.body.interval_hours || 24)))
+  if (req.body.enabled && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid backup recipient email.' })
+  const workspace = await one('workspaces', { id: req.user.workspace_id }), schedule = { ...(workspace?.backup_schedule || {}), enabled:Boolean(req.body.enabled), email, interval_hours:interval, only_if_changed:req.body.only_if_changed !== false, updated_at:now(), updated_by:req.user.user }
+  await update('workspaces', { id:req.user.workspace_id }, { backup_schedule:schedule, updated_at:now() }); res.json(schedule)
+} catch (e) { next(e) } })
+
+app.get('/api/cron/backups', async (req, res, next) => { try {
+  const secret = String(process.env.CRON_SECRET || ''), authorization = String(req.headers.authorization || '')
+  if (!secret || authorization !== `Bearer ${secret}`) return res.status(401).json({ error:'Invalid scheduler authorization.' })
+  const workspaces = (await list('workspaces')).filter((row) => row.active !== false && row.backup_schedule?.enabled), results=[]
+  for (const workspace of workspaces) {
+    const schedule=workspace.backup_schedule, due=!schedule.last_sent_at || Date.now()-Date.parse(schedule.last_sent_at)>=Number(schedule.interval_hours||24)*3600000
+    if (!due) continue
+    const backup=await workspaceBackup(workspace.id), content=JSON.stringify(backup,null,2), hash=createHash('sha256').update(content.replace(/"created_at":\s*"[^"]+"/,'"created_at":""')).digest('hex')
+    if (schedule.only_if_changed && schedule.last_content_hash===hash) { results.push({workspace_id:workspace.id,status:'unchanged'}); continue }
+    try {
+      await sendConfiguredEmail({to:schedule.email,subject:`${workspace.name} backup · ${backup.created_at.slice(0,10)}`,text:'Your scheduled Boutique Cloud JSON recovery backup is attached.',html:`<p>Your scheduled <strong>${String(workspace.name).replace(/[<>&"']/g,'')}</strong> recovery backup is attached.</p>`,attachments:[{filename:`boutique-backup-${backup.created_at.slice(0,10)}.json`,content}]},{workspaceId:workspace.id})
+      await update('workspaces',{id:workspace.id},{backup_schedule:{...schedule,last_sent_at:now(),last_content_hash:hash,last_status:'sent'}}); results.push({workspace_id:workspace.id,status:'sent'})
+    } catch(error) { await update('workspaces',{id:workspace.id},{backup_schedule:{...schedule,last_attempt_at:now(),last_status:readableError(error)}}); results.push({workspace_id:workspace.id,status:'failed'}) }
+  }
+  res.json({ok:true,processed:results.length,results})
+} catch(e){next(e)} })
 
 app.post('/api/passbook/parse', auth, permit('passbook', { write: true }), upload.array('files', 10), async (req, res, next) => { try {
   if (!req.files?.length) return res.status(400).json({ error: 'Choose one or more PDF files.' })

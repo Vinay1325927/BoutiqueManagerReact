@@ -6,6 +6,9 @@
     "api/index.js": { "maxDuration": 300 },
     "api/pdf.py": { "maxDuration": 300 }
   },
+  "crons": [
+    { "path": "/api/cron/backups", "schedule": "0 0 * * *" }
+  ],
   "rewrites": [
     { "source": "/pdf-service", "destination": "/api/pdf" },
     { "source": "/api/:path*", "destination": "/api/index" },

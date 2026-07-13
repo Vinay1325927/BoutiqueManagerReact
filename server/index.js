@@ -136,7 +136,7 @@ async function readTransient(name, id, match = {}) {
 }
 
 const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
-const OWNER_FEATURES = [...BUSINESS_FEATURES, 'iam', 'security', 'smtp', 'technical', 'backup', 'settings']
+const OWNER_FEATURES = [...BUSINESS_FEATURES, 'gmail', 'iam', 'security', 'smtp', 'technical', 'backup', 'settings']
 const PERSONAL_BOUTIQUE_FEATURES = OWNER_FEATURES
 const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
@@ -318,6 +318,34 @@ function oauthSettings(provider, req) {
   }
   return null
 }
+
+function gmailOAuthSettings(req) {
+  return {
+    clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: `${requestOrigin(req)}/api/gmail/oauth/callback`,
+    authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth', tokenUrl: 'https://oauth2.googleapis.com/token',
+    scope: 'openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
+  }
+}
+
+async function gmailAccess(workspaceId) {
+  const id=`workspace:${workspaceId}`,settings=await one('app_settings',{id}),gmail=settings?.gmail
+  if(!gmail?.refresh_token_encrypted)return null
+  if(gmail.access_token_encrypted&&Date.parse(gmail.access_expires_at||'')>Date.now()+60000)return{token:decryptSecret(gmail.access_token_encrypted),gmail,settings}
+  const response=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:process.env.GOOGLE_CLIENT_ID||'',client_secret:process.env.GOOGLE_CLIENT_SECRET||'',refresh_token:decryptSecret(gmail.refresh_token_encrypted),grant_type:'refresh_token'})})
+  const token=await response.json().catch(()=>({}));if(!response.ok||!token.access_token)throw new Error(token.error_description||token.error||'Google access expired. Reconnect Gmail.')
+  const patch={...gmail,access_token_encrypted:encryptSecret(token.access_token),access_expires_at:new Date(Date.now()+Number(token.expires_in||3600)*1000).toISOString(),updated_at:now()}
+  await update('app_settings',{id},{gmail:patch,updated_at:now()});return{token:token.access_token,gmail:patch,settings}
+}
+
+async function gmailRequest(workspaceId,path,options={}){
+  const access=await gmailAccess(workspaceId);if(!access)throw new Error('Connect a Gmail account first.')
+  const response=await fetch(`https://gmail.googleapis.com/gmail/v1/users/me${path}`,{...options,headers:{Authorization:`Bearer ${access.token}`,...(options.body?{'Content-Type':'application/json'}:{}),...(options.headers||{})}})
+  const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error?.message||'Gmail API request failed.');return data
+}
+
+function gmailHeader(message,name){return message.payload?.headers?.find(header=>header.name?.toLocaleLowerCase()===name.toLocaleLowerCase())?.value||''}
+function gmailBody(part){if(part?.mimeType==='text/plain'&&part.body?.data)return Buffer.from(part.body.data.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8');for(const child of(part?.parts||[])){const value=gmailBody(child);if(value)return value}if(part?.mimeType==='text/html'&&part.body?.data)return Buffer.from(part.body.data.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();return''}
 
 function landingRedirect(req, key, value) {
   const url = new URL(requestOrigin(req))
@@ -969,15 +997,24 @@ app.get('/api/settings', auth, permit('settings'), async (req, res, next) => { t
 app.put('/api/settings', auth, permit('settings', { write: true }), async (req, res, next) => { try {
   const workspace = await one('workspaces', { id: req.user.workspace_id })
   if (!workspace) return res.status(404).json({ error: 'Workspace not found.' })
-  const requestedUsername=String(req.body.username||req.body.profile?.requested_username||req.user.username).trim(), parsed = signupInput({ ...(workspace.profile || {}), ...(req.body.profile || {}), requested_username: requestedUsername, password: 'not-used', confirm_password: 'not-used', terms: true }, false)
-  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const requestedUsername=String(req.body.username||req.body.profile?.requested_username||req.user.username).trim(), input=req.body.profile||{}
+  if(!/^[A-Za-z0-9._-]{3,50}$/.test(requestedUsername))return res.status(400).json({error:'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.'})
+  const profile={...(workspace.profile||{})}
+  const limits={full_name:120,email:180,phone:40,organization_name:160,organization_type:100,job_title:100,team_size:30,website:250,city:100,state:100,country:100,use_case:1500,how_heard:200}
+  for(const [key,limit] of Object.entries(limits))if(Object.hasOwn(input,key))profile[key]=String(input[key]||'').replace(/\s+/g,' ').trim().slice(0,limit)
+  if(Object.hasOwn(input,'logo'))profile.logo=String(input.logo||'').trim()
+  if(!profile.organization_name)profile.organization_name=workspace.name||req.user.username
+  if(profile.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(profile.email))return res.status(400).json({error:'Enter a valid business email address.'})
+  if(profile.phone){const digits=profile.phone.replace(/\D/g,'');if(digits.length<7||digits.length>16)return res.status(400).json({error:'Enter a valid phone number.'})}
+  if(profile.logo&&(!/^data:image\/(png|jpeg|webp);base64,/i.test(profile.logo)||profile.logo.length>1400000))return res.status(400).json({error:'Upload a PNG, JPEG or WebP logo smaller than 1 MB.'})
   const users=await list('iam_users'), reserved=usernameKey(process.env.USERNAME||'Admin')
-  if (parsed.data.username_key===reserved||parsed.data.username_key==='admin'||users.some(row=>row.id!==workspace.owner_user_id&&row.username_key===parsed.data.username_key)) return res.status(409).json({error:'That preferred username is already in use or reserved.'})
-  if(users.some(row=>row.id!==workspace.owner_user_id&&usernameKey(row.profile?.email||row.profile?.email_key)===parsed.data.email_key)) return res.status(409).json({error:'That business email is already linked to another account.'})
-  const profile = { ...(workspace.profile || {}), ...parsed.data, requested_username: undefined, username_key: undefined, email_key: parsed.data.email }
+  const requestedKey=usernameKey(requestedUsername),emailKey=usernameKey(profile.email)
+  if(requestedKey===reserved||requestedKey==='admin'||users.some(row=>row.id!==workspace.owner_user_id&&row.username_key===requestedKey))return res.status(409).json({error:'That preferred username is already in use or reserved.'})
+  if(emailKey&&users.some(row=>row.id!==workspace.owner_user_id&&usernameKey(row.profile?.email||row.profile?.email_key)===emailKey))return res.status(409).json({error:'That business email is already linked to another account.'})
+  profile.email_key=emailKey
   const patch = { name: workspaceName(profile, req.user.username), profile, updated_at: now(), updated_by: req.user.user }
   await update('workspaces', { id: workspace.id }, patch)
-  await update('iam_users', { id: workspace.owner_user_id }, { username:requestedUsername, username_key:parsed.data.username_key, profile, updated_at: now() })
+  await update('iam_users', { id: workspace.owner_user_id }, { username:requestedUsername, username_key:requestedKey, profile, updated_at: now() })
   res.json({ profile, username:requestedUsername, workspace_name: patch.name, backup_schedule: workspace.backup_schedule || {} })
 } catch (e) { next(e) } })
 app.post('/api/settings/password', auth, permit('settings', { write: true }), async (req,res,next)=>{try{
@@ -986,6 +1023,27 @@ app.post('/api/settings/password', auth, permit('settings', { write: true }), as
   if(user?.password_hash&&!(await bcrypt.compare(String(req.body.current_password||''),user.password_hash)))return res.status(400).json({error:'Current password is incorrect.'})
   await update('iam_users',{id:user.id},{password_hash:await bcrypt.hash(password,12),password_changed_at:now(),updated_at:now()});res.json({ok:true})
 }catch(e){next(e)}})
+
+app.post('/api/gmail/oauth/start',auth,permit('gmail',{write:true}),async(req,res,next)=>{try{
+  const config=gmailOAuthSettings(req);if(!config.clientId||!config.clientSecret)return res.status(503).json({error:'Google OAuth is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Vercel.'})
+  const state={id:randomUUID(),provider:'gmail',purpose:'gmail_connect',user_id:req.user.user_id,workspace_id:req.user.workspace_id,used:false,created_at:now(),expires_at:new Date(Date.now()+10*60*1000).toISOString()};await insert('oauth_states',state)
+  const url=new URL(config.authorizeUrl);url.search=new URLSearchParams({client_id:config.clientId,redirect_uri:config.redirectUri,response_type:'code',scope:config.scope,state:state.id,access_type:'offline',prompt:'consent',include_granted_scopes:'true',login_hint:String(req.body.email||'')}).toString();res.json({url:url.toString(),redirect_uri:config.redirectUri})
+}catch(e){next(e)}})
+
+app.get('/api/gmail/oauth/callback',async(req,res)=>{const redirect=new URL(requestOrigin(req));try{
+  const config=gmailOAuthSettings(req),state=await consumeTransient('oauth_states',String(req.query.state||''),{provider:'gmail',purpose:'gmail_connect'});if(!state)throw new Error('The Gmail connection request is invalid or expired.');if(req.query.error)throw new Error(String(req.query.error_description||req.query.error))
+  const response=await fetch(config.tokenUrl,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:config.clientId||'',client_secret:config.clientSecret||'',code:String(req.query.code||''),grant_type:'authorization_code',redirect_uri:config.redirectUri})}),token=await response.json().catch(()=>({}));if(!response.ok||!token.access_token)throw new Error(token.error_description||token.error||'Google token exchange failed.')
+  const profileResponse=await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:`Bearer ${token.access_token}`}}),profile=await profileResponse.json().catch(()=>({}));if(!profileResponse.ok||!profile.email)throw new Error('Google did not return the Gmail account email.')
+  const id=`workspace:${state.workspace_id}`,settings=await one('app_settings',{id}),old=settings?.gmail||{};if(!token.refresh_token&&!old.refresh_token_encrypted)throw new Error('Google did not return offline access. Reconnect and approve Gmail access.')
+  const gmail={email:String(profile.email).toLocaleLowerCase(),name:String(profile.name||''),refresh_token_encrypted:token.refresh_token?encryptSecret(token.refresh_token):old.refresh_token_encrypted,access_token_encrypted:encryptSecret(token.access_token),access_expires_at:new Date(Date.now()+Number(token.expires_in||3600)*1000).toISOString(),scope:String(token.scope||config.scope),connected_at:old.connected_at||now(),updated_at:now(),connected_by:state.user_id}
+  if(settings)await update('app_settings',{id},{gmail,updated_at:now()});else await insert('app_settings',{id,workspace_id:state.workspace_id,gmail,updated_at:now()});redirect.searchParams.set('gmail_connected','1')
+}catch(error){redirect.searchParams.set('gmail_error',readableError(error,'Gmail connection failed.'))}res.redirect(redirect.toString())})
+
+app.get('/api/gmail/status',auth,permit('gmail'),async(req,res,next)=>{try{const settings=await one('app_settings',{id:`workspace:${req.user.workspace_id}`}),gmail=settings?.gmail;res.json({connected:Boolean(gmail?.refresh_token_encrypted),email:gmail?.email||'',name:gmail?.name||'',connected_at:gmail?.connected_at||''})}catch(e){next(e)}})
+app.get('/api/gmail/messages',auth,permit('gmail'),async(req,res,next)=>{try{const max=Math.max(1,Math.min(50,Number(req.query.limit||20))),query=String(req.query.q||'').slice(0,200),params=new URLSearchParams({maxResults:String(max),...(query?{q:query}:{})}),listed=await gmailRequest(req.user.workspace_id,`/messages?${params}`),messages=await Promise.all((listed.messages||[]).map(async item=>{const row=await gmailRequest(req.user.workspace_id,`/messages/${item.id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`);return{id:row.id,thread_id:row.threadId,snippet:row.snippet||'',from:gmailHeader(row,'From'),to:gmailHeader(row,'To'),subject:gmailHeader(row,'Subject')||'(No subject)',date:gmailHeader(row,'Date'),label_ids:row.labelIds||[]}}));res.json({messages,next_page_token:listed.nextPageToken||''})}catch(e){next(e)}})
+app.get('/api/gmail/messages/:id',auth,permit('gmail'),async(req,res,next)=>{try{const row=await gmailRequest(req.user.workspace_id,`/messages/${encodeURIComponent(req.params.id)}?format=full`);res.json({id:row.id,thread_id:row.threadId,from:gmailHeader(row,'From'),to:gmailHeader(row,'To'),subject:gmailHeader(row,'Subject')||'(No subject)',date:gmailHeader(row,'Date'),body:gmailBody(row.payload),snippet:row.snippet||'',label_ids:row.labelIds||[]})}catch(e){next(e)}})
+app.post('/api/gmail/send',auth,permit('gmail',{write:true}),async(req,res,next)=>{try{const to=String(req.body.to||'').replace(/[\r\n]/g,'').trim(),subject=String(req.body.subject||'').replace(/[\r\n]/g,' ').trim().slice(0,300),body=String(req.body.body||'').slice(0,100000);if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to))return res.status(400).json({error:'Enter a valid recipient email.'});if(!body.trim())return res.status(400).json({error:'Write an email message.'});const encodedSubject=/^[\x00-\x7F]*$/.test(subject)?subject:`=?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,raw=Buffer.from(`To: ${to}\r\nSubject: ${encodedSubject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${body}`).toString('base64url'),sent=await gmailRequest(req.user.workspace_id,'/messages/send',{method:'POST',body:JSON.stringify({raw})});res.json({ok:true,id:sent.id,thread_id:sent.threadId})}catch(e){next(e)}})
+app.delete('/api/gmail/connection',auth,permit('gmail',{write:true}),async(req,res,next)=>{try{const id=`workspace:${req.user.workspace_id}`,settings=await one('app_settings',{id}),gmail=settings?.gmail;if(gmail?.refresh_token_encrypted)fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(decryptSecret(gmail.refresh_token_encrypted))}`,{method:'POST'}).catch(()=>{});await update('app_settings',{id},{gmail:null,updated_at:now()});res.status(204).end()}catch(e){next(e)}})
 
 app.get('/api/smtp', auth, permit('smtp'), async (req, res, next) => { try {
   const settings = await one('app_settings', { id: `workspace:${req.user.workspace_id}` })

@@ -58,9 +58,12 @@ Register these callbacks with the providers:
 ```text
 https://your-production-domain.vercel.app/api/auth/oauth/google/callback
 https://your-production-domain.vercel.app/api/auth/oauth/microsoft/callback
+https://your-production-domain.vercel.app/api/gmail/oauth/callback
 ```
 
 An existing verified identity signs in. A new identity completes the remaining organisation questions, then receives its private workspace immediately.
+
+Enable the Gmail API in the same Google Cloud project and add the Gmail callback above. Workspace owners can then connect their own Gmail account from the separate **Gmail** sidebar page, read/search messages, open message content, send mail, and revoke the connection. Refresh and access tokens are encrypted in the workspace settings record.
 
 ### Gmail / SMTP
 

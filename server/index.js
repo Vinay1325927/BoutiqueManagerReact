@@ -137,7 +137,8 @@ async function readTransient(name, id, match = {}) {
 }
 
 const OWNER_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
-const FEATURE_IDS = [...OWNER_FEATURES, 'technical', 'backup', 'platform']
+const PERSONAL_BOUTIQUE_FEATURES = [...OWNER_FEATURES, 'technical']
+const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'backup', 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
 const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
@@ -149,7 +150,7 @@ function publicUser(row) {
     id: row.id,
     username: row.username,
     role: row.role,
-    permissions: row.role === 'admin' ? FEATURE_IDS : row.role === 'owner' ? OWNER_FEATURES : row.role === 'viewer' ? VIEWER_FEATURES : (row.permissions || []).filter((id) => CUSTOM_FEATURE_IDS.includes(id)),
+    permissions: row.role === 'admin' ? FEATURE_IDS : row.role === 'owner' ? (row.source === 'personal_boutique' ? PERSONAL_BOUTIQUE_FEATURES : OWNER_FEATURES) : row.role === 'viewer' ? VIEWER_FEATURES : (row.permissions || []).filter((id) => CUSTOM_FEATURE_IDS.includes(id)),
     active: row.active !== false,
     source: row.source || 'managed',
     platform_admin: row.source === 'environment' || row.platform_admin === true,
@@ -238,7 +239,7 @@ async function ensurePersonalBoutique() {
   else await insert('workspaces', workspacePatch)
 
   const userPatch = {
-    username, username_key: key, role: 'owner', permissions: OWNER_FEATURES, active: true, source: 'personal_boutique', platform_admin: false,
+    username, username_key: key, role: 'owner', permissions: PERSONAL_BOUTIQUE_FEATURES, active: true, source: 'personal_boutique', platform_admin: false,
     workspace_id: workspaceId, signup_method: 'shared_password', password_hash: passwordHash, profile,
     auth_providers: user?.source === 'personal_boutique' ? (user.auth_providers || []) : [], updated_at: now(),
   }
@@ -515,7 +516,7 @@ async function auth(req, res, next) {
 function canAccess(user, feature, write = false) {
   if (user.platform_admin) return feature === 'platform'
   if (user.role === 'admin') return true
-  if (user.role === 'owner') return OWNER_FEATURES.includes(feature)
+  if (user.role === 'owner') return (user.permissions || OWNER_FEATURES).includes(feature)
   if (user.role === 'viewer') return !write && VIEWER_FEATURES.includes(feature)
   return user.role === 'custom' && (user.permissions || []).includes(feature)
 }
@@ -906,11 +907,11 @@ app.patch('/api/devices/:id', auth, permit('security', { adminOnly: true }), asy
 app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { const row = (await one('app_settings', { id: 'global' })) || {}; const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
 app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const { smtp: _ignoredSmtp, ...input } = req.body || {}; const row = { ...old, ...input, smtp: old?.smtp, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
 
-app.get('/api/smtp', auth, permit('technical', { adminOnly: true }), async (_req, res, next) => { try {
+app.get('/api/smtp', auth, permit('technical'), async (_req, res, next) => { try {
   const settings = await one('app_settings', { id: 'global' })
   res.json(publicSmtp(settings?.smtp))
 } catch (e) { next(e) } })
-app.put('/api/smtp', auth, permit('technical', { adminOnly: true }), async (req, res, next) => { try {
+app.put('/api/smtp', auth, permit('technical', { write: true }), async (req, res, next) => { try {
   const settings = await one('app_settings', { id: 'global' }), parsed = smtpInput(req.body || {}, settings?.smtp || {})
   if (parsed.error) return res.status(400).json({ error: parsed.error })
   const smtp = { ...parsed.value, updated_at: now(), updated_by: req.user.user }
@@ -918,7 +919,7 @@ app.put('/api/smtp', auth, permit('technical', { adminOnly: true }), async (req,
   else await insert('app_settings', { id: 'global', smtp, updated_at: now(), updated_by: req.user.user })
   res.json(publicSmtp(smtp))
 } catch (e) { next(e) } })
-app.post('/api/smtp/test', auth, permit('technical', { adminOnly: true }), async (req, res, next) => { try {
+app.post('/api/smtp/test', auth, permit('technical', { write: true }), async (req, res, next) => { try {
   const to = String(req.body.to || '').trim().toLocaleLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Enter a valid test recipient email address.' })
   const info = await sendConfiguredEmail({

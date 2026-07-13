@@ -319,9 +319,31 @@ function oauthSettings(provider, req) {
   return null
 }
 
-function gmailOAuthSettings(req) {
+function publicGmailOAuth(value = {}, req) {
+  const clientId = value.client_id || process.env.GOOGLE_CLIENT_ID || ''
   return {
-    clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    configured: Boolean(clientId && (value.client_secret_encrypted || process.env.GOOGLE_CLIENT_SECRET)),
+    client_id: clientId, client_secret_configured: Boolean(value.client_secret_encrypted || process.env.GOOGLE_CLIENT_SECRET),
+    redirect_uri: req ? `${requestOrigin(req)}/api/gmail/oauth/callback` : '', updated_at: value.updated_at || '', updated_by: value.updated_by || '',
+    source: value.client_secret_encrypted ? 'workspace' : (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET ? 'platform' : ''),
+  }
+}
+
+function gmailOAuthInput(body = {}, old = {}) {
+  const clientId = String(body.client_id || old.client_id || '').trim().slice(0, 250)
+  const clientSecret = String(body.client_secret || '')
+  if (!clientId) return { error: 'Enter the Google OAuth Client ID.' }
+  if (!clientSecret && !old.client_secret_encrypted) return { error: 'Enter the Google OAuth Client Secret.' }
+  return { value: {
+    client_id: clientId, client_secret_encrypted: clientSecret ? encryptSecret(clientSecret) : old.client_secret_encrypted,
+  } }
+}
+
+async function gmailOAuthSettings(req, workspaceId) {
+  const settings = await one('app_settings', { id: `workspace:${workspaceId}` }), oauth = settings?.gmail_oauth || {}
+  return {
+    clientId: oauth.client_id || process.env.GOOGLE_CLIENT_ID || '',
+    clientSecret: oauth.client_secret_encrypted ? decryptSecret(oauth.client_secret_encrypted) : (process.env.GOOGLE_CLIENT_SECRET || ''),
     redirectUri: `${requestOrigin(req)}/api/gmail/oauth/callback`,
     authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth', tokenUrl: 'https://oauth2.googleapis.com/token',
     scope: 'openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
@@ -332,7 +354,9 @@ async function gmailAccess(workspaceId) {
   const id=`workspace:${workspaceId}`,settings=await one('app_settings',{id}),gmail=settings?.gmail
   if(!gmail?.refresh_token_encrypted)return null
   if(gmail.access_token_encrypted&&Date.parse(gmail.access_expires_at||'')>Date.now()+60000)return{token:decryptSecret(gmail.access_token_encrypted),gmail,settings}
-  const response=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:process.env.GOOGLE_CLIENT_ID||'',client_secret:process.env.GOOGLE_CLIENT_SECRET||'',refresh_token:decryptSecret(gmail.refresh_token_encrypted),grant_type:'refresh_token'})})
+  const oauth=settings?.gmail_oauth||{},clientId=oauth.client_id||process.env.GOOGLE_CLIENT_ID||'',clientSecret=oauth.client_secret_encrypted?decryptSecret(oauth.client_secret_encrypted):(process.env.GOOGLE_CLIENT_SECRET||'')
+  if(!clientId||!clientSecret)throw new Error('Save this workspace’s Google OAuth Client ID and Client Secret before using Gmail.')
+  const response=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:clientId,client_secret:clientSecret,refresh_token:decryptSecret(gmail.refresh_token_encrypted),grant_type:'refresh_token'})})
   const token=await response.json().catch(()=>({}));if(!response.ok||!token.access_token)throw new Error(token.error_description||token.error||'Google access expired. Reconnect Gmail.')
   const patch={...gmail,access_token_encrypted:encryptSecret(token.access_token),access_expires_at:new Date(Date.now()+Number(token.expires_in||3600)*1000).toISOString(),updated_at:now()}
   await update('app_settings',{id},{gmail:patch,updated_at:now()});return{token:token.access_token,gmail:patch,settings}
@@ -1024,14 +1048,29 @@ app.post('/api/settings/password', auth, permit('settings', { write: true }), as
   await update('iam_users',{id:user.id},{password_hash:await bcrypt.hash(password,12),password_changed_at:now(),updated_at:now()});res.json({ok:true})
 }catch(e){next(e)}})
 
+app.get('/api/gmail/oauth-config',auth,permit('gmail'),async(req,res,next)=>{try{
+  const settings=await one('app_settings',{id:`workspace:${req.user.workspace_id}`})
+  res.json(publicGmailOAuth(settings?.gmail_oauth,req))
+}catch(e){next(e)}})
+
+app.put('/api/gmail/oauth-config',auth,permit('gmail',{write:true}),async(req,res,next)=>{try{
+  const id=`workspace:${req.user.workspace_id}`,settings=await one('app_settings',{id}),parsed=gmailOAuthInput(req.body||{},settings?.gmail_oauth||{})
+  if(parsed.error)return res.status(400).json({error:parsed.error})
+  const gmail_oauth={...parsed.value,updated_at:now(),updated_by:req.user.user},patch={gmail_oauth,updated_at:now(),updated_by:req.user.user}
+  if(settings?.gmail?.refresh_token_encrypted&&settings?.gmail_oauth?.client_id&&settings.gmail_oauth.client_id!==gmail_oauth.client_id)patch.gmail=null
+  if(settings)await update('app_settings',{id},patch);else await insert('app_settings',{id,workspace_id:req.user.workspace_id,...patch})
+  res.json(publicGmailOAuth(gmail_oauth,req))
+}catch(e){next(e)}})
+
 app.post('/api/gmail/oauth/start',auth,permit('gmail',{write:true}),async(req,res,next)=>{try{
-  const config=gmailOAuthSettings(req);if(!config.clientId||!config.clientSecret)return res.status(503).json({error:'Google OAuth is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Vercel.'})
+  const config=await gmailOAuthSettings(req,req.user.workspace_id);if(!config.clientId||!config.clientSecret)return res.status(503).json({error:'Google OAuth is not configured for this workspace. Open Gmail setup and save your Google Client ID and Client Secret first.',redirect_uri:config.redirectUri})
   const state={id:randomUUID(),provider:'gmail',purpose:'gmail_connect',user_id:req.user.user_id,workspace_id:req.user.workspace_id,used:false,created_at:now(),expires_at:new Date(Date.now()+10*60*1000).toISOString()};await insert('oauth_states',state)
   const url=new URL(config.authorizeUrl);url.search=new URLSearchParams({client_id:config.clientId,redirect_uri:config.redirectUri,response_type:'code',scope:config.scope,state:state.id,access_type:'offline',prompt:'consent',include_granted_scopes:'true',login_hint:String(req.body.email||'')}).toString();res.json({url:url.toString(),redirect_uri:config.redirectUri})
 }catch(e){next(e)}})
 
 app.get('/api/gmail/oauth/callback',async(req,res)=>{const redirect=new URL(requestOrigin(req));try{
-  const config=gmailOAuthSettings(req),state=await consumeTransient('oauth_states',String(req.query.state||''),{provider:'gmail',purpose:'gmail_connect'});if(!state)throw new Error('The Gmail connection request is invalid or expired.');if(req.query.error)throw new Error(String(req.query.error_description||req.query.error))
+  const state=await consumeTransient('oauth_states',String(req.query.state||''),{provider:'gmail',purpose:'gmail_connect'});if(!state)throw new Error('The Gmail connection request is invalid or expired.');if(req.query.error)throw new Error(String(req.query.error_description||req.query.error))
+  const config=await gmailOAuthSettings(req,state.workspace_id);if(!config.clientId||!config.clientSecret)throw new Error('Google OAuth is not configured for this workspace. Save the Gmail setup again and reconnect.')
   const response=await fetch(config.tokenUrl,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:config.clientId||'',client_secret:config.clientSecret||'',code:String(req.query.code||''),grant_type:'authorization_code',redirect_uri:config.redirectUri})}),token=await response.json().catch(()=>({}));if(!response.ok||!token.access_token)throw new Error(token.error_description||token.error||'Google token exchange failed.')
   const profileResponse=await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:`Bearer ${token.access_token}`}}),profile=await profileResponse.json().catch(()=>({}));if(!profileResponse.ok||!profile.email)throw new Error('Google did not return the Gmail account email.')
   const id=`workspace:${state.workspace_id}`,settings=await one('app_settings',{id}),old=settings?.gmail||{};if(!token.refresh_token&&!old.refresh_token_encrypted)throw new Error('Google did not return offline access. Reconnect and approve Gmail access.')

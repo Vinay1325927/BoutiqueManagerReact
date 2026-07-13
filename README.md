@@ -34,7 +34,6 @@ Passbook extraction and bill PDF generation are handled by `server/python_bridge
 - Billing with downloadable PDF invoices
 - Revenue, profit, category, customer, and payment analytics
 - Pending-payment reminders
-- Inventory tracking and low-stock status
 - Passbook PDF text extraction
 - Work notes
 - Gemini or OpenAI business assistant

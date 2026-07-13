@@ -26,7 +26,7 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const collections = ['sales', 'inventory', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'auth_challenges']
+const collections = ['sales', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'auth_challenges']
 const backupCollections = collections.filter((name) => name !== 'auth_challenges')
 for (const name of collections) memory.set(name, [])
 
@@ -105,9 +105,9 @@ async function consumeChallenge(id, key) {
   return clean(row)
 }
 
-const FEATURE_IDS = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'inventory', 'passbook', 'notes', 'ai', 'technical', 'backup']
+const FEATURE_IDS = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai', 'technical', 'backup']
 const CUSTOM_FEATURE_IDS = FEATURE_IDS.filter((id) => id !== 'backup')
-const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'inventory', 'notes', 'ai']
+const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
 const now = () => new Date().toISOString()
 
@@ -425,15 +425,6 @@ app.post('/api/sales/:id/payment', auth, permit('review', { write: true }), asyn
   await update('sales', { id }, patch); res.json({ ...row, ...patch })
 } catch (e) { next(e) } })
 
-app.get('/api/inventory', auth, permitAny(['inventory', 'vendors', 'ai', 'technical']), async (_req, res, next) => { try { res.json(await list('inventory')) } catch (e) { next(e) } })
-app.post('/api/inventory', auth, permit('inventory', { write: true }), async (req, res, next) => { try {
-  const id = Number(req.body.id || 0), existing = id ? await one('inventory', { id }) : null
-  const row = { id: existing?.id || await nextId('inventory'), item: String(req.body.item || '').trim(), vendor: String(req.body.vendor || '').trim(), category: req.body.category || 'Other', quantity: Number(req.body.quantity || 0), reorder_level: Number(req.body.reorder_level || 0), cost_price: Number(req.body.cost_price || 0), selling_price: Number(req.body.selling_price || 0), updated_at: new Date().toISOString() }
-  if (!row.item) return res.status(400).json({ error: 'Item name is required.' })
-  existing ? await update('inventory', { id }, row) : await insert('inventory', row); res.json(row)
-} catch (e) { next(e) } })
-app.delete('/api/inventory/:id', auth, permit('inventory', { write: true }), async (req, res, next) => { try { await remove('inventory', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
-
 app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (_req, res, next) => { try { const rows = await list('work_notes'); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
 app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
 app.delete('/api/notes/:id', auth, permit('notes', { write: true }), async (req, res, next) => { try { await remove('work_notes', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
@@ -517,8 +508,8 @@ async function askAI(question, context) {
   throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.')
 }
 app.post('/api/ai', auth, permit('ai'), async (req, res, next) => { try {
-  const sales = (await list('sales')).slice(-150), inventory = (await list('inventory')).slice(-100), notes = (await list('work_notes')).slice(-30)
-  const context = JSON.stringify({ sales, inventory, notes }).slice(0, 80000)
+  const sales = (await list('sales')).slice(-150), notes = (await list('work_notes')).slice(-30)
+  const context = JSON.stringify({ sales, notes }).slice(0, 80000)
   res.json({ answer: await askAI(String(req.body.question || ''), context) })
 } catch (e) { next(e) } })
 

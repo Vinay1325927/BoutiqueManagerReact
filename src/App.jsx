@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Activity, AlertTriangle, ArchiveRestore, BarChart3, BookOpen, Bot, ChevronLeft,
-  ChevronRight, CircleDollarSign, ClipboardList, CloudDownload, Database, FileSearch, FileText,
-  Eye, Fingerprint, Home, IndianRupee, KeyRound, LockKeyhole, LogIn, LogOut, Menu, Moon, NotebookPen, PencilLine, Plus,
-  ReceiptText, RefreshCw, Search, Settings, ShieldCheck, ShoppingBag, Sparkles, Sun, Trash2,
-  TrendingUp, Upload, UserCog, UserRound, UsersRound, WalletCards, X,
+  Activity, AlertTriangle, ArchiveRestore, BarChart3, BookOpen, Bot, Building2, CheckCircle2, ChevronLeft,
+  ChevronRight, CircleDollarSign, ClipboardList, CloudDownload, Database, FileSearch, FileText, Gauge, Globe2,
+  Eye, Fingerprint, Home, IndianRupee, KeyRound, Layers3, LockKeyhole, LogIn, LogOut, Mail, MapPin, Menu, Moon, NotebookPen, PencilLine, Phone, Plus,
+  ReceiptText, RefreshCw, Rocket, Search, Settings, ShieldCheck, ShoppingBag, Sparkles, Store, Sun, Trash2,
+  TrendingUp, Upload, UserCog, UserPlus, UserRound, UsersRound, WalletCards, Workflow, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { format, parseISO, differenceInDays } from 'date-fns'
@@ -87,7 +87,7 @@ function Notice({ value, clear }) { return value ? <div className={`notice ${val
 
 const blankSale = () => ({ customer_name: '', customer_phone: '', sale_date: today(), vendor: '', product_category: 'Sarees', product_description: '', buying_price: '', selling_price: '', amount_paid: '', payment_method: 'UPI', delay_status: false, notes: '' })
 
-function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sale', customerSales = [] }) {
+function SaleForm({ initial, onSave, submitLabel = 'Save sale', customerSales = [] }) {
   const [form, setForm] = useState(initial || blankSale())
   const [busy, setBusy] = useState(false)
   const [customerMode, setCustomerMode] = useState('existing')
@@ -102,7 +102,7 @@ function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sal
       })
     return [...customers.values()].sort((a, b) => a.name.localeCompare(b.name))
   }, [customerSales])
-  const canChooseExisting = !initial && !publicMode && customerOptions.length > 0
+  const canChooseExisting = !initial && customerOptions.length > 0
   const choosingExisting = canChooseExisting && customerMode === 'existing'
   const set = (key, value) => setForm((old) => ({ ...old, [key]: value }))
   const changeCustomerMode = (mode) => {
@@ -131,18 +131,92 @@ function SaleForm({ initial, onSave, publicMode = false, submitLabel = 'Save sal
       <div className="amount-preview"><span>Pending after this sale</span><strong>{money(pending)}</strong></div>
     </div>
     <Field label="Notes" as="textarea" rows="3" value={form.notes} onChange={(e) => set('notes', e.target.value)} placeholder="Alterations, delivery details, colour, size…" />
-    <div className="form-actions">{publicMode && <p>No sign-in needed. The boutique team can review this entry.</p>}<Button type="submit" icon={busy ? RefreshCw : Plus} disabled={busy}>{busy ? 'Saving…' : submitLabel}</Button></div>
+    <div className="form-actions"><Button type="submit" icon={busy ? RefreshCw : Plus} disabled={busy}>{busy ? 'Saving…' : submitLabel}</Button></div>
   </form>
 }
 
+const LANDING_FEATURES = [
+  [ShoppingBag, 'Sales workspace', 'Record new and repeat customer orders with payment, vendor and product details.'],
+  [WalletCards, 'Accounts & collections', 'Review balances, record collections and follow up on delayed or high-value payments.'],
+  [ReceiptText, 'Professional bills', 'Generate customer PDF statements with permanent bill history and transaction snapshots.'],
+  [FileSearch, 'Passbook reader', 'Use the Python-powered extractor to read transaction PDFs and convert selected rows into sales.'],
+  [BarChart3, 'Business analytics', 'Understand revenue, profit, customers, categories, payment methods and vendor performance.'],
+  [UserCog, 'IAM & secure login', 'Control admin, custom and viewer access, revoke sessions and use locally generated PEM credentials.'],
+  [Bot, 'AI assistant', 'Ask questions about accounts, collections, vendors, work notes and daily priorities.'],
+  [ArchiveRestore, 'Protected backups', 'Administrators can export and restore application data with a controlled backup workflow.'],
+]
+
 function PublicHome({ onLogin }) {
-  const [loginOpen, setLoginOpen] = useState(false), [notice, setNotice] = useState(null)
-  async function addSale(form) { try { await request('/public/sales', { method: 'POST', body: JSON.stringify(form) }); setNotice({ text: 'Sale submitted successfully.' }) } catch (e) { setNotice({ type: 'error', text: e.message }); throw e } }
-  return <main className="public-page">
-    <header className="public-nav"><div className="brand-lockup"><img src="/krishna_symbol.png" onError={(e) => { e.currentTarget.style.display = 'none' }} /><div><strong>Shree Krishna</strong><span>Boutique manager</span></div></div><Button variant="ghost" icon={LogIn} onClick={() => setLoginOpen(true)}>Team sign in</Button></header>
-    <div className="public-wrap"><section className="hero"><span className="eyebrow">Shree Krishna Boutique</span><h1>Beautifully simple<br /><em>sale entry.</em></h1><p>Record customer purchases and payment details. Your entry is saved securely for the boutique team.</p><div className="hero-pills"><span>Private & secure</span><span>Instant confirmation</span><span>Mobile friendly</span></div></section><Card className="public-form"><div className="card-heading"><span className="icon-box"><ShoppingBag /></span><div><h2>New sale</h2><p>Enter the purchase details below</p></div></div><Notice value={notice} clear={() => setNotice(null)} /><SaleForm publicMode onSave={addSale} /></Card></div>
+  const [loginOpen, setLoginOpen] = useState(false), [signupOpen, setSignupOpen] = useState(false), [notice, setNotice] = useState(null)
+  useEffect(()=>{const params=new URLSearchParams(window.location.search),ticket=params.get('oauth_ticket'),oauthError=params.get('oauth_error'),signupStatus=params.get('signup_status');if(!ticket&&!oauthError&&!signupStatus)return;window.history.replaceState({},'',window.location.pathname);if(oauthError){setNotice({type:'error',text:oauthError});setLoginOpen(true);return}if(signupStatus==='pending'){setNotice({text:'Your verified social signup was submitted for administrator approval.'});return}request('/auth/oauth/exchange',{method:'POST',body:JSON.stringify({ticket})}).then((data)=>{localStorage.setItem('boutique_token',data.token);localStorage.setItem('boutique_user',JSON.stringify(data.user));onLogin(data.user)}).catch((error)=>{setNotice({type:'error',text:error.message});setLoginOpen(true)})},[onLogin])
+  return <main className="public-page landing-page">
+    <header className="public-nav landing-nav"><a className="brand-lockup" href="#top"><img src="/krishna_symbol.png" onError={(e) => { e.currentTarget.style.display = 'none' }} /><div><strong>Shree Krishna</strong><span>Boutique manager</span></div></a><nav><a href="#features">Features</a><a href="#platform">Technology</a><a href="#security">Security</a></nav><div className="landing-auth"><Button variant="ghost" icon={LogIn} onClick={() => setLoginOpen(true)}>Log in</Button><Button icon={UserPlus} onClick={() => setSignupOpen(true)}>Sign up</Button></div></header>
+    <div className="landing-notice"><Notice value={notice} clear={()=>setNotice(null)}/></div>
+    <section className="landing-hero" id="top"><div className="landing-copy"><span className="landing-kicker"><Sparkles/>A complete boutique operations workspace</span><h1>Run every boutique account from <em>one calm workspace.</em></h1><p>Manage sales, customers, collections, bills, passbook records, vendors, analytics and team access without scattered spreadsheets or manual follow-ups.</p><div className="landing-actions"><Button icon={Rocket} onClick={() => setSignupOpen(true)}>Request your workspace</Button><Button variant="secondary" icon={LogIn} onClick={() => setLoginOpen(true)}>Team login</Button></div><div className="landing-trust"><span><CheckCircle2/>Role-based access</span><span><CheckCircle2/>MongoDB records</span><span><CheckCircle2/>PEM authentication</span></div></div><div className="product-window"><div className="product-window-top"><div><span/><span/><span/></div><small>Business overview</small><span className="badge green">Live workspace</span></div><div className="product-metrics"><div><span>Revenue</span><strong>₹56,395</strong><small>Sales performance</small></div><div><span>Pending</span><strong>₹41,486</strong><small>Collection queue</small></div><div><span>Customers</span><strong>128</strong><small>Relationship records</small></div></div><div className="product-body"><div className="product-chart"><div className="chart-heading"><span>Monthly revenue</span><small>Revenue · Profit</small></div><div className="chart-bars">{[38,62,48,82,57,74,92,68].map((height,index)=><i key={index} style={{height:`${height}%`}}/>)}</div></div><div className="product-activity"><span>Today’s priorities</span>{[['Collect pending payment','₹8,500'],['Generate customer bill','PDF'],['Review passbook entries','12 rows']].map(([label,value])=><div key={label}><i/><p>{label}<small>Ready for action</small></p><strong>{value}</strong></div>)}</div></div></div></section>
+    <section className="landing-section feature-section" id="features"><div className="landing-heading"><span className="eyebrow">Everything in one place</span><h2>Built around the way a boutique actually works.</h2><p>Each area is connected to the same protected business data, so your team can move from a sale to collection, billing and reporting without re-entering information.</p></div><div className="feature-grid">{LANDING_FEATURES.map(([Icon,title,copy],index)=><article key={title}><span className={`feature-icon tone-${index%4}`}><Icon/></span><h3>{title}</h3><p>{copy}</p><small>{String(index+1).padStart(2,'0')}</small></article>)}</div></section>
+    <section className="landing-section platform-section" id="platform"><div className="platform-copy"><span className="eyebrow">Modern technology</span><h2>Fast in the browser. Powerful behind the scenes.</h2><p>The interface is designed for daily business use while dedicated backend services handle authentication, MongoDB persistence and document processing.</p><div className="platform-points"><div><Gauge/><span><strong>React interface</strong><small>Responsive dashboards and workflows for desktop or mobile.</small></span></div><div><Database/><span><strong>MongoDB data layer</strong><small>Persistent sales, bills, IAM, security and registration records.</small></span></div><div><Workflow/><span><strong>Express API</strong><small>Central validation, role enforcement and business operations.</small></span></div><div><Layers3/><span><strong>Python document tools</strong><small>Passbook extraction and downloadable PDF bill generation.</small></span></div></div></div><div className="platform-stack"><span className="stack-orbit orbit-one">React</span><span className="stack-orbit orbit-two">MongoDB</span><span className="stack-orbit orbit-three">Python</span><span className="stack-orbit orbit-four">Vercel</span><div><Globe2/><strong>One connected platform</strong><small>Securely available wherever your team works.</small></div></div></section>
+    <section className="landing-section security-section" id="security"><div className="security-showcase"><span><ShieldCheck/></span><div><span className="eyebrow">Security by design</span><h2>Give every person exactly the access they need.</h2><p>Administrators manage users and sessions, custom roles receive selected features, and viewers remain read-only. PEM sign-in uses one-time challenges while the private key stays on the user’s device.</p></div></div><div className="security-cards"><article><UserCog/><strong>Admin</strong><p>Full application, IAM and security control.</p></article><article><Settings/><strong>Custom access</strong><p>Only administrator-selected business features.</p></article><article><Eye/><strong>Viewer</strong><p>Protected read-only access with server-side enforcement.</p></article></div></section>
+    <section className="landing-cta"><span className="eyebrow">Ready to get organised?</span><h2>Bring your boutique operations into one workspace.</h2><p>Send your business details and an administrator will review your access request.</p><div><Button icon={UserPlus} onClick={() => setSignupOpen(true)}>Create access request</Button><Button variant="ghost" onClick={() => setLoginOpen(true)}>Already registered? Log in</Button></div></section>
+    <footer className="landing-footer"><div className="brand-lockup"><img src="/krishna_symbol.png" onError={(e) => { e.currentTarget.style.display = 'none' }} /><div><strong>Shree Krishna</strong><span>Boutique manager</span></div></div><p>Sales, accounts, billing and secure team access in one connected workspace.</p><span>React · Express · MongoDB · Python</span></footer>
     {loginOpen && <LoginModal close={() => setLoginOpen(false)} onLogin={onLogin} />}
+    {signupOpen && <SignupModal close={() => setSignupOpen(false)} openLogin={() => { setSignupOpen(false); setLoginOpen(true) }} />}
   </main>
+}
+
+const blankSignup = () => ({ full_name:'',email:'',phone:'',organization_name:'',organization_type:'Boutique / Fashion retail',job_title:'',team_size:'1–5',website:'',city:'',state:'',country:'India',requested_username:'',password:'',confirm_password:'',use_case:'',how_heard:'',terms:false })
+function SignupModal({ close, openLogin }) {
+  const [form,setForm]=useState(blankSignup()),[busy,setBusy]=useState(false),[error,setError]=useState(''),[complete,setComplete]=useState(false)
+  const set=(key,value)=>setForm((old)=>({...old,[key]:value}))
+  async function submit(e){e.preventDefault();setError('');if(form.password!==form.confirm_password)return setError('Passwords do not match.');if(!form.terms)return setError('Please confirm the information and access terms.');setBusy(true);try{await request('/auth/signup',{method:'POST',body:JSON.stringify(form)});setComplete(true)}catch(e){setError(e.message)}finally{setBusy(false)}}
+  async function socialSignup(provider){setError('');const required=['full_name','email','phone','organization_name','organization_type','city','state','country','requested_username'];if(required.some((key)=>!String(form[key]||'').trim()))return setError('Complete all required contact and organisation details before continuing.');if(!form.terms)return setError('Please confirm the information and access terms.');setBusy(true);try{const result=await request('/auth/signup/oauth/prepare',{method:'POST',body:JSON.stringify(form)});window.location.assign(`/api/auth/oauth/${provider}/start?intent=signup&request_id=${encodeURIComponent(result.request_id)}`)}catch(e){setError(e.message);setBusy(false)}}
+  return <div className="modal-backdrop" onMouseDown={close}>
+    <div className="modal signup-modal" onMouseDown={(e)=>e.stopPropagation()}>
+      <button className="modal-close" onClick={close}><X/></button>
+      {complete ? <div className="signup-complete">
+        <span><CheckCircle2/></span><span className="eyebrow">Request received</span>
+        <h2>Thank you, {form.full_name.split(' ')[0]}.</h2>
+        <p>Your organisation and account details are saved securely. An administrator must approve the request before you can log in.</p>
+        <div><Button icon={LogIn} onClick={openLogin}>Go to login</Button><Button variant="ghost" onClick={close}>Close</Button></div>
+      </div> : <>
+        <div className="signup-head"><span className="login-mark"><Building2/></span><div><span className="eyebrow">Workspace registration</span><h2>Tell us about you and your organisation.</h2><p>Complete the details below. Your request will appear in the administrator’s IAM approval queue.</p></div></div>
+        <form onSubmit={submit}>
+          <div className="signup-section">
+            <h3><UserRound/>Contact details</h3>
+            <div className="form-grid three">
+              <Field label="Full name" value={form.full_name} onChange={(e)=>set('full_name',e.target.value)} required/>
+              <Field label="Business email" type="email" value={form.email} onChange={(e)=>set('email',e.target.value)} required/>
+              <Field label="Phone number" type="tel" value={form.phone} onChange={(e)=>set('phone',e.target.value)} required/>
+              <Field label="Job title / role" value={form.job_title} onChange={(e)=>set('job_title',e.target.value)} placeholder="Owner, accountant, manager…"/>
+              <Field label="Preferred username" value={form.requested_username} onChange={(e)=>set('requested_username',e.target.value)} minLength="3" required/>
+              <Field label="How did you hear about us?" value={form.how_heard} onChange={(e)=>set('how_heard',e.target.value)}/>
+            </div>
+          </div>
+          <div className="signup-section">
+            <h3><Store/>Organisation details</h3>
+            <div className="form-grid three">
+              <Field label="Organisation name" value={form.organization_name} onChange={(e)=>set('organization_name',e.target.value)} required/>
+              <Field label="Organisation type" as="select" value={form.organization_type} onChange={(e)=>set('organization_type',e.target.value)}><option>Boutique / Fashion retail</option><option>Designer studio</option><option>Tailoring / Alterations</option><option>Wholesale / Distribution</option><option>Multi-store retail</option><option>Independent professional</option><option>Other</option></Field>
+              <Field label="Team size" as="select" value={form.team_size} onChange={(e)=>set('team_size',e.target.value)}><option>1–5</option><option>6–15</option><option>16–50</option><option>51–100</option><option>100+</option></Field>
+              <Field label="Website / social page" type="url" value={form.website} onChange={(e)=>set('website',e.target.value)} placeholder="https://"/>
+              <Field label="City" value={form.city} onChange={(e)=>set('city',e.target.value)} required/>
+              <Field label="State" value={form.state} onChange={(e)=>set('state',e.target.value)} required/>
+              <Field label="Country" value={form.country} onChange={(e)=>set('country',e.target.value)} required/>
+            </div>
+            <Field label="What would you like to manage?" as="textarea" rows="3" value={form.use_case} onChange={(e)=>set('use_case',e.target.value)} placeholder="Sales, collections, billing, passbook entries, reporting…"/>
+          </div>
+          <div className="signup-section">
+            <h3><LockKeyhole/>Account security</h3>
+            <div className="signup-oauth"><div><strong>Use an existing identity</strong><small>Your verified provider email will be linked after administrator approval.</small></div><div className="oauth-buttons"><button type="button" disabled={busy} onClick={()=>socialSignup('google')}><span className="oauth-google">G</span>Sign up with Google</button><button type="button" disabled={busy} onClick={()=>socialSignup('microsoft')}><span className="oauth-microsoft"><i/><i/><i/><i/></span>Sign up with Microsoft</button></div></div>
+            <div className="auth-divider"><span>or create a workspace password</span></div>
+            <div className="form-grid two"><Field label="Password" type="password" minLength="8" value={form.password} onChange={(e)=>set('password',e.target.value)} required/><Field label="Confirm password" type="password" minLength="8" value={form.confirm_password} onChange={(e)=>set('confirm_password',e.target.value)} required/></div>
+            <label className="signup-consent"><input type="checkbox" checked={form.terms} onChange={(e)=>set('terms',e.target.checked)}/><span>I confirm these details are correct and understand that access requires administrator approval.</span></label>
+          </div>
+          {error&&<p className="form-error">{error}</p>}
+          <div className="signup-actions"><p><ShieldCheck/>Passwords are hashed; social identities are verified by the provider.</p><Button icon={UserPlus} disabled={busy}>{busy?'Submitting request…':'Submit access request'}</Button></div>
+        </form>
+      </>}
+    </div>
+  </div>
 }
 
 function pemBytes(pem) {
@@ -187,7 +261,7 @@ function LoginModal({ close, onLogin }) {
       }
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
-  return <div className="modal-backdrop" onMouseDown={close}><div className="modal login-modal" onMouseDown={(e) => e.stopPropagation()}><button className="modal-close" onClick={close}><X /></button><span className="login-mark">{mode === 'password' ? <ShieldCheck /> : <Fingerprint />}</span><span className="eyebrow">Protected workspace</span><h2>Welcome back</h2><p>Sign in with a password or your registered PEM key.</p><div className="login-tabs"><button className={mode === 'password' ? 'active' : ''} onClick={() => { setMode('password'); setError('') }}><LockKeyhole />Password</button><button className={mode === 'pem' ? 'active' : ''} onClick={() => { setMode('pem'); setError('') }}><KeyRound />PEM file</button></div><form onSubmit={submit}><Field label="Username" autoFocus value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} />{mode === 'password' ? <Field label="Password" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /> : <label className="pem-picker"><span>Private PEM file</span><input type="file" accept=".pem,.key,application/x-pem-file" onChange={(e) => setPemFile(e.target.files[0] || null)} /><small>{pemFile ? pemFile.name : 'Choose an unencrypted PKCS#8 private key. It never leaves this browser.'}</small></label>}{error && <p className="form-error">{error}</p>}<Button type="submit" disabled={busy} icon={mode === 'password' ? LogIn : Fingerprint}>{busy ? 'Signing in…' : mode === 'password' ? 'Sign in' : 'Verify PEM & sign in'}</Button></form><small>{mode === 'password' ? 'Credentials are verified securely by the server.' : 'Only a signed one-time challenge is sent to the server.'}</small></div></div>
+  return <div className="modal-backdrop" onMouseDown={close}><div className="modal login-modal" onMouseDown={(e) => e.stopPropagation()}><button className="modal-close" onClick={close}><X /></button><span className="login-mark">{mode === 'password' ? <ShieldCheck /> : <Fingerprint />}</span><span className="eyebrow">Protected workspace</span><h2>Welcome back</h2><p>Sign in using an approved IAM identity.</p><div className="oauth-buttons"><button type="button" onClick={()=>window.location.assign('/api/auth/oauth/google/start?intent=login')}><span className="oauth-google">G</span>Continue with Google</button><button type="button" onClick={()=>window.location.assign('/api/auth/oauth/microsoft/start?intent=login')}><span className="oauth-microsoft"><i/><i/><i/><i/></span>Continue with Microsoft</button></div><div className="auth-divider"><span>or use workspace credentials</span></div><div className="login-tabs"><button className={mode === 'password' ? 'active' : ''} onClick={() => { setMode('password'); setError('') }}><LockKeyhole />Password</button><button className={mode === 'pem' ? 'active' : ''} onClick={() => { setMode('pem'); setError('') }}><KeyRound />PEM file</button></div><form onSubmit={submit}><Field label="Username" autoFocus value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} />{mode === 'password' ? <Field label="Password" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /> : <label className="pem-picker"><span>Private PEM file</span><input type="file" accept=".pem,.key,application/x-pem-file" onChange={(e) => setPemFile(e.target.files[0] || null)} /><small>{pemFile ? pemFile.name : 'Choose an unencrypted PKCS#8 private key. It never leaves this browser.'}</small></label>}{error && <p className="form-error">{error}</p>}<Button type="submit" disabled={busy} icon={mode === 'password' ? LogIn : Fingerprint}>{busy ? 'Signing in…' : mode === 'password' ? 'Sign in' : 'Verify PEM & sign in'}</Button></form><small>{mode === 'password' ? 'Credentials are verified securely by the server.' : 'Only a signed one-time challenge is sent to the server.'}</small></div></div>
 }
 
 function Shell({ user, logout }) {
@@ -346,13 +420,18 @@ function AI(){const quick=['Summarize today’s business status and what needs a
 
 function Technical({sales,notes}){const[health,setHealth]=useState(null);useEffect(()=>{request('/health').then(setHealth)},[]);const collections=[['Sales',sales.length],['Work notes',notes.length]];return <><PageHead eyebrow="System administration" title="Technical overview" /><div className="metrics-grid compact"><Metric label="API status" value={health?.ok?'Online':'Checking…'} icon={Activity} tone="green"/><Metric label="Database" value={health?.database||'—'} icon={Database}/><Metric label="App version" value="3.0 React" icon={Sparkles} tone="violet"/></div><Card className="technical-card"><div className="card-title"><div><h2>Data collections</h2><p>Live records available to this workspace</p></div></div>{collections.map(([n,v])=><div className="collection-row" key={n}><span><Database/>{n}</span><strong>{v} documents</strong></div>)}</Card><Card className="env-help"><AlertTriangle/><div><h3>Environment configuration</h3><p>MongoDB, authentication, JWT and AI provider keys are server-only. Copy <code>.env.example</code> to <code>.env</code> and fill in production values before deployment.</p></div></Card></>}
 
-const blankIam = () => ({ username: '', password: '', role: 'viewer', permissions: [], active: true })
+const blankIam = () => ({ username: '', email: '', password: '', role: 'viewer', permissions: [], active: true })
 
 function IAM({ notice, currentUser }) {
-  const [users, setUsers] = useState([]), [form, setForm] = useState(blankIam()), [editing, setEditing] = useState(''), [busy, setBusy] = useState(false)
-  const load = useCallback(() => request('/iam/users').then(setUsers).catch((e) => notice({ type: 'error', text: e.message })), [notice])
+  const [users, setUsers] = useState([]), [requests, setRequests] = useState([]), [form, setForm] = useState(blankIam()), [editing, setEditing] = useState(''), [busy, setBusy] = useState(false)
+  const load = useCallback(async () => {
+    try {
+      const [userRows, signupRows] = await Promise.all([request('/iam/users'), request('/iam/signup-requests')])
+      setUsers(userRows); setRequests(signupRows)
+    } catch (e) { notice({ type: 'error', text: e.message }) }
+  }, [notice])
   useEffect(() => { load() }, [load])
-  function start(user) { setEditing(user.id); setForm({ username: user.username, password: '', role: user.role, permissions: user.permissions || [], active: user.active !== false }) }
+  function start(user) { setEditing(user.id); setForm({ username: user.username, email: user.profile?.email || '', password: '', role: user.role, permissions: user.permissions || [], active: user.active !== false }) }
   function reset() { setEditing(''); setForm(blankIam()) }
   function togglePermission(id) { setForm((old) => ({ ...old, permissions: old.permissions.includes(id) ? old.permissions.filter((value) => value !== id) : [...old.permissions, id] })) }
   async function save(e) {
@@ -368,11 +447,35 @@ function IAM({ notice, currentUser }) {
     if (!confirm(`Delete IAM user ${user.username}?`)) return
     try { await request(`/iam/users/${user.id}`, { method: 'DELETE' }); notice({ text: `${user.username} deleted.` }); if (editing === user.id) reset(); await load() } catch (e) { notice({ type: 'error', text: e.message }) }
   }
+  async function approveSignup(signup) {
+    setBusy(true)
+    try {
+      const user = await request(`/iam/signup-requests/${signup.id}/approve`, { method: 'POST' })
+      notice({ text: `${signup.full_name} approved as a Viewer. You can now edit ${user.username}'s role and feature access.` }); await load()
+    } catch (e) { notice({ type: 'error', text: e.message }) } finally { setBusy(false) }
+  }
+  async function rejectSignup(signup) {
+    if (!confirm(`Reject the signup request from ${signup.full_name}?`)) return
+    setBusy(true)
+    try { await request(`/iam/signup-requests/${signup.id}/reject`, { method: 'PATCH', body: JSON.stringify({}) }); notice({ text: `${signup.full_name}'s request was rejected.` }); await load() }
+    catch (e) { notice({ type: 'error', text: e.message }) } finally { setBusy(false) }
+  }
   const editingUser = users.find((user) => user.id === editing), locked = editingUser?.source === 'environment'
+  const openRequests = requests.filter((row) => ['pending', 'oauth_pending'].includes(row.status))
   return <><PageHead eyebrow="Identity & access management" title="IAM" action={<Button icon={Plus} onClick={reset}>New user</Button>} />
     <Card className="security-banner"><span><UserCog/></span><div><h2>MongoDB-backed team access</h2><p>Admins have full control. Custom access grants selected sidebar features. Viewers can browse approved screens but cannot change records.</p></div></Card>
-    <div className="iam-layout"><Card className="table-card"><div className="card-title"><div><h2>Workspace users</h2><p>{users.length} account{users.length === 1 ? '' : 's'} stored in IAM</p></div></div>{users.length ? <div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Features</th><th>PEM</th><th>Status</th><th/></tr></thead><tbody>{users.map((user) => <tr key={user.id} className={editing === user.id ? 'selected-row' : ''}><td><strong>{user.username}</strong><small>{user.source === 'environment' ? 'Vercel environment admin' : user.last_login_at ? `Last login ${dateLabel(user.last_login_at)}` : 'Never signed in'}</small></td><td><span className={`badge ${user.role === 'admin' ? 'blue' : user.role === 'viewer' ? 'amber' : 'green'}`}>{ROLE_LABELS[user.role]}</span></td><td>{user.role === 'admin' ? 'All' : user.permissions?.length || 0}</td><td><span className={`badge ${user.pem?.enabled ? 'green' : 'red'}`}>{user.pem?.enabled ? 'Enabled' : 'Not set'}</span></td><td><span className={`badge ${user.active ? 'green' : 'red'}`}>{user.active ? 'Active' : 'Disabled'}</span></td><td><div className="row-buttons"><Button variant="tiny" onClick={() => start(user)}>Edit</Button>{user.source !== 'environment' && user.id !== currentUser.id && <button className="row-action danger" onClick={() => removeUser(user)} title="Delete user"><Trash2/></button>}</div></td></tr>)}</tbody></table></div> : <Empty icon={UserCog} title="No IAM users found" />}</Card>
-      <Card className="iam-form"><div className="card-title"><div><h2>{editing ? `Edit ${form.username}` : 'Create user'}</h2><p>{locked ? 'Managed by server environment variables' : editing ? 'Leave password blank to keep it unchanged' : 'Add a protected workspace account'}</p></div></div><form onSubmit={save}><Field label="Username" value={form.username} disabled={Boolean(editing)} onChange={(e) => setForm({ ...form, username: e.target.value })} required/><Field label={editing ? 'New password (optional)' : 'Password'} type="password" minLength="8" disabled={locked} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required={!editing}/><Field label="Role" as="select" disabled={locked} value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value, permissions: e.target.value === 'custom' ? form.permissions : [] })}><option value="admin">Admin — full access</option><option value="custom">Custom — selected features</option><option value="viewer">Viewer — read only</option></Field>{form.role === 'custom' && <div className="permission-box"><span>Allowed features</span><div className="permission-grid">{FEATURE_OPTIONS.map((feature) => <label key={feature.id}><input type="checkbox" checked={form.permissions.includes(feature.id)} onChange={() => togglePermission(feature.id)} /><span>{feature.label}</span></label>)}</div></div>}<label className="switch-row"><input type="checkbox" checked={form.active} disabled={locked} onChange={(e) => setForm({ ...form, active: e.target.checked })}/><span><strong>Active account</strong><small>Disabled users are signed out and cannot log in.</small></span></label><div className="form-actions">{editing && <Button type="button" variant="ghost" onClick={reset}>Cancel</Button>}<Button type="submit" icon={UserCog} disabled={busy || locked}>{busy ? 'Saving…' : editing ? 'Save access' : 'Create user'}</Button></div></form></Card>
+    <Card className="signup-queue">
+      <div className="card-title"><div><h2>Signup approval queue</h2><p>Review identity and organisation details before creating an IAM account.</p></div><span className={`badge ${openRequests.length ? 'amber' : 'green'}`}>{openRequests.length} open</span></div>
+      {openRequests.length ? <div className="signup-request-grid">{openRequests.map((signup) => <article key={signup.id} className="signup-request-card">
+        <div className="signup-request-head"><div className="request-avatar">{signup.full_name?.slice(0,1).toUpperCase()}</div><div><strong>{signup.full_name}</strong><small>@{signup.requested_username} · {signup.job_title || 'Role not provided'}</small></div><span className={`badge ${signup.status === 'pending' ? 'green' : 'amber'}`}>{signup.status === 'pending' ? 'Verified' : 'Awaiting verification'}</span></div>
+        <div className="request-contact"><span><Mail/>{signup.email}</span><span><Phone/>{signup.phone}</span><span><MapPin/>{[signup.city,signup.state,signup.country].filter(Boolean).join(', ')}</span></div>
+        <div className="request-organisation"><strong>{signup.organization_name}</strong><span>{signup.organization_type} · {signup.team_size || 'Team size not provided'}</span>{signup.use_case && <p>{signup.use_case}</p>}</div>
+        <div className="request-meta"><span className="badge blue">{signup.signup_method === 'oauth' ? `${signup.oauth_provider || 'Social'} signup` : 'Password signup'}</span><small>Requested {dateLabel(signup.created_at)}</small></div>
+        <div className="request-actions"><Button variant="ghost" disabled={busy} onClick={()=>rejectSignup(signup)}>Reject</Button><Button icon={CheckCircle2} disabled={busy || signup.status !== 'pending'} onClick={()=>approveSignup(signup)}>{signup.status === 'pending' ? 'Approve as viewer' : 'Verification required'}</Button></div>
+      </article>)}</div> : <Empty icon={CheckCircle2} title="No signup requests waiting" copy="New password and verified social registrations will appear here."/>}
+    </Card>
+    <div className="iam-layout"><Card className="table-card"><div className="card-title"><div><h2>Workspace users</h2><p>{users.length} account{users.length === 1 ? '' : 's'} stored in IAM</p></div></div>{users.length ? <div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Features</th><th>PEM</th><th>Status</th><th/></tr></thead><tbody>{users.map((user) => <tr key={user.id} className={editing === user.id ? 'selected-row' : ''}><td><strong>{user.username}</strong><small>{user.profile?.email || (user.source === 'environment' ? 'Vercel environment admin' : user.last_login_at ? `Last login ${dateLabel(user.last_login_at)}` : 'Never signed in')}</small></td><td><span className={`badge ${user.role === 'admin' ? 'blue' : user.role === 'viewer' ? 'amber' : 'green'}`}>{ROLE_LABELS[user.role]}</span></td><td>{user.role === 'admin' ? 'All' : user.permissions?.length || 0}</td><td><span className={`badge ${user.pem?.enabled ? 'green' : 'red'}`}>{user.pem?.enabled ? 'Enabled' : 'Not set'}</span></td><td><span className={`badge ${user.active ? 'green' : 'red'}`}>{user.active ? 'Active' : 'Disabled'}</span></td><td><div className="row-buttons"><Button variant="tiny" onClick={() => start(user)}>Edit</Button>{user.source !== 'environment' && user.id !== currentUser.id && <button className="row-action danger" onClick={() => removeUser(user)} title="Delete user"><Trash2/></button>}</div></td></tr>)}</tbody></table></div> : <Empty icon={UserCog} title="No IAM users found" />}</Card>
+      <Card className="iam-form"><div className="card-title"><div><h2>{editing ? `Edit ${form.username}` : 'Create user'}</h2><p>{locked ? 'Managed by server environment variables' : editing ? 'Leave password blank to keep it unchanged' : 'Add a protected workspace account'}</p></div></div><form onSubmit={save}><Field label="Username" value={form.username} disabled={Boolean(editing)} onChange={(e) => setForm({ ...form, username: e.target.value })} required/><Field label="Email for Google / Microsoft" type="email" value={form.email} disabled={locked} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@organisation.com"/><Field label={editing ? 'New password (optional)' : 'Password'} type="password" minLength="8" disabled={locked} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required={!editing}/><Field label="Role" as="select" disabled={locked} value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value, permissions: e.target.value === 'custom' ? form.permissions : [] })}><option value="admin">Admin — full access</option><option value="custom">Custom — selected features</option><option value="viewer">Viewer — read only</option></Field>{form.role === 'custom' && <div className="permission-box"><span>Allowed features</span><div className="permission-grid">{FEATURE_OPTIONS.map((feature) => <label key={feature.id}><input type="checkbox" checked={form.permissions.includes(feature.id)} onChange={() => togglePermission(feature.id)} /><span>{feature.label}</span></label>)}</div></div>}<label className="switch-row"><input type="checkbox" checked={form.active} disabled={locked} onChange={(e) => setForm({ ...form, active: e.target.checked })}/><span><strong>Active account</strong><small>Disabled users are signed out and cannot log in.</small></span></label><div className="form-actions">{editing && <Button type="button" variant="ghost" onClick={reset}>Cancel</Button>}<Button type="submit" icon={UserCog} disabled={busy || locked}>{busy ? 'Saving…' : editing ? 'Save access' : 'Create user'}</Button></div></form></Card>
     </div>
   </>
 }

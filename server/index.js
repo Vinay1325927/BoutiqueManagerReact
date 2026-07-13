@@ -26,8 +26,8 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const collections = ['sales', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'auth_challenges']
-const backupCollections = collections.filter((name) => name !== 'auth_challenges')
+const collections = ['sales', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets']
+const backupCollections = collections.filter((name) => !['auth_challenges', 'oauth_states', 'oauth_tickets'].includes(name))
 for (const name of collections) memory.set(name, [])
 
 async function connectDb() {
@@ -105,6 +105,22 @@ async function consumeChallenge(id, key) {
   return clean(row)
 }
 
+async function consumeTransient(name, id, match = {}) {
+  const usedAt = now()
+  if (database) {
+    const row = await database.collection(name).findOneAndUpdate(
+      { id, used: false, expires_at: { $gt: usedAt }, ...match },
+      { $set: { used: true, used_at: usedAt } },
+      { returnDocument: 'before', projection: { _id: 0 } },
+    )
+    return clean(row)
+  }
+  const row = await one(name, { id })
+  if (!row || row.used || row.expires_at <= usedAt || Object.entries(match).some(([key, value]) => row[key] !== value)) return null
+  row.used = true; row.used_at = usedAt
+  return clean(row)
+}
+
 const FEATURE_IDS = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai', 'technical', 'backup']
 const CUSTOM_FEATURE_IDS = FEATURE_IDS.filter((id) => id !== 'backup')
 const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
@@ -123,6 +139,7 @@ function publicUser(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_login_at: row.last_login_at,
+    profile: row.profile || {},
     pem: {
       enabled: Boolean(row.pem_public_key),
       fingerprint: row.pem_fingerprint || '',
@@ -132,11 +149,19 @@ function publicUser(row) {
   }
 }
 
+function publicSignupRequest(row) {
+  if (!row) return null
+  const { password_hash: _passwordHash, ...safe } = row
+  return safe
+}
+
 async function ensureEnvironmentAdmin() {
   const username = String(process.env.USERNAME || 'admin').trim()
   const key = usernameKey(username)
   const existing = await one('iam_users', { username_key: key })
-  const patch = { username, username_key: key, role: 'admin', permissions: FEATURE_IDS, active: true, source: 'environment', updated_at: now() }
+  const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLocaleLowerCase()
+  const profile = adminEmail ? { ...(existing?.profile || {}), email: adminEmail, email_key: adminEmail } : (existing?.profile || {})
+  const patch = { username, username_key: key, role: 'admin', permissions: FEATURE_IDS, active: true, source: 'environment', profile, updated_at: now() }
   if (existing) {
     await update('iam_users', { id: existing.id }, patch)
     return { ...existing, ...patch }
@@ -144,6 +169,62 @@ async function ensureEnvironmentAdmin() {
   const row = { id: randomUUID(), ...patch, created_at: now(), created_by: 'environment' }
   await insert('iam_users', row)
   return row
+}
+
+function requestOrigin(req) {
+  const configured = String(process.env.OAUTH_REDIRECT_BASE || '').replace(/\/$/, '')
+  if (configured) return configured
+  const protocol = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
+  return `${protocol}://${req.get('host')}`
+}
+
+function oauthSettings(provider, req) {
+  const redirectUri = `${requestOrigin(req)}/api/auth/oauth/${provider}/callback`
+  if (provider === 'google') return {
+    provider, label: 'Google', clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri, authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth', tokenUrl: 'https://oauth2.googleapis.com/token',
+    userInfoUrl: 'https://openidconnect.googleapis.com/v1/userinfo', scope: 'openid email profile',
+  }
+  if (provider === 'microsoft') {
+    const tenant = encodeURIComponent(process.env.MICROSOFT_TENANT_ID || 'common')
+    return {
+      provider, label: 'Microsoft', clientId: process.env.MICROSOFT_CLIENT_ID, clientSecret: process.env.MICROSOFT_CLIENT_SECRET,
+      redirectUri, authorizeUrl: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`, tokenUrl: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
+      userInfoUrl: 'https://graph.microsoft.com/oidc/userinfo', scope: 'openid profile email',
+    }
+  }
+  return null
+}
+
+function landingRedirect(req, key, value) {
+  const url = new URL(requestOrigin(req))
+  url.searchParams.set(key, value)
+  return url.toString()
+}
+
+async function exchangeOAuthCode(settings, code) {
+  if (!code) throw new Error(`${settings.label} did not return an authorization code.`)
+  const tokenResponse = await fetch(settings.tokenUrl, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: settings.clientId, client_secret: settings.clientSecret, code, grant_type: 'authorization_code', redirect_uri: settings.redirectUri }),
+  })
+  const token = await tokenResponse.json().catch(() => ({}))
+  if (!tokenResponse.ok || !token.access_token) throw new Error(token.error_description || token.error || `${settings.label} token exchange failed.`)
+  const profileResponse = await fetch(settings.userInfoUrl, { headers: { Authorization: `Bearer ${token.access_token}` } })
+  const profile = await profileResponse.json().catch(() => ({}))
+  if (!profileResponse.ok) throw new Error(profile.error?.message || profile.error_description || `${settings.label} profile request failed.`)
+  const email = String(profile.email || profile.preferred_username || '').trim().toLocaleLowerCase()
+  if (!email || !email.includes('@')) throw new Error(`${settings.label} did not provide a usable email address.`)
+  if (settings.provider === 'google' && profile.email_verified === false) throw new Error('The Google email address is not verified.')
+  const subject = String(profile.sub || '').trim()
+  if (!subject) throw new Error(`${settings.label} did not return a stable account identifier.`)
+  return { provider: settings.provider, subject, email, name: String(profile.name || '').trim(), picture: String(profile.picture || '') }
+}
+
+async function findIamUserForOAuth(identity) {
+  const users = await list('iam_users')
+  return users.find((user) => (user.auth_providers || []).some((provider) => provider.provider === identity.provider && provider.subject === identity.subject))
+    || users.find((user) => usernameKey(user.profile?.email || user.profile?.email_key) === identity.email)
 }
 
 function readableError(value, fallback = 'Unexpected server error.') {
@@ -292,6 +373,122 @@ app.post('/api/auth/login', async (req, res) => {
   const device = await recordLogin(req, user, 'password')
   res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
 })
+
+function signupInput(body, passwordRequired) {
+  const data = {
+    full_name: String(body.full_name || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+    email: String(body.email || '').trim().toLocaleLowerCase().slice(0, 180),
+    phone: String(body.phone || '').trim().slice(0, 40),
+    organization_name: String(body.organization_name || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+    organization_type: String(body.organization_type || '').trim().slice(0, 100),
+    job_title: String(body.job_title || '').trim().slice(0, 100),
+    team_size: String(body.team_size || '').trim().slice(0, 30),
+    website: String(body.website || '').trim().slice(0, 250),
+    city: String(body.city || '').trim().slice(0, 100), state: String(body.state || '').trim().slice(0, 100), country: String(body.country || '').trim().slice(0, 100),
+    requested_username: String(body.requested_username || '').trim(), use_case: String(body.use_case || '').trim().slice(0, 1500), how_heard: String(body.how_heard || '').trim().slice(0, 200),
+  }
+  const password = String(body.password || ''), confirmPassword = String(body.confirm_password || '')
+  if (!data.full_name || !data.organization_name || !data.organization_type || !data.city || !data.state || !data.country) return { error: 'Complete all required contact and organisation details.' }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) return { error: 'Enter a valid business email address.' }
+  const phoneDigits = data.phone.replace(/\D/g, '')
+  if (phoneDigits.length < 7 || phoneDigits.length > 16) return { error: 'Enter a valid phone number.' }
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(data.requested_username)) return { error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' }
+  if (body.terms !== true) return { error: 'Confirm the registration information and access terms.' }
+  if (passwordRequired && (password.length < 8 || password !== confirmPassword)) return { error: password !== confirmPassword ? 'Passwords do not match.' : 'Use a password with at least 8 characters.' }
+  return { data: { ...data, email_key: data.email, username_key: usernameKey(data.requested_username) }, password }
+}
+
+async function createSignupRequest(req, mode) {
+  const parsed = signupInput(req.body, mode === 'password')
+  if (parsed.error) return { error: parsed.error }
+  const { data, password } = parsed
+  const users = await list('iam_users')
+  if (users.some((user) => user.username_key === data.username_key)) return { error: 'That username already belongs to an IAM account.' }
+  if (users.some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === data.email_key)) return { error: 'An IAM account already exists for this email. Please log in instead.' }
+  const requests = await list('signup_requests')
+  const existingOAuth = mode === 'oauth' && requests.find((row) => row.status === 'oauth_pending' && row.username_key === data.username_key && row.email_key === data.email_key)
+  if (existingOAuth) {
+    const patch = { ...data, updated_at: now(), user_agent: req.headers['user-agent'] || existingOAuth.user_agent || '' }
+    await update('signup_requests', { id: existingOAuth.id }, patch)
+    return { row: { ...existingOAuth, ...patch } }
+  }
+  if (requests.some((row) => ['pending', 'oauth_pending'].includes(row.status) && (row.username_key === data.username_key || row.email_key === data.email_key))) return { error: 'A registration request already exists for this email or username.' }
+  const row = {
+    id: randomUUID(), ...data, signup_method: mode, status: mode === 'password' ? 'pending' : 'oauth_pending', terms_accepted: true,
+    password_hash: mode === 'password' ? await bcrypt.hash(password, 12) : '', created_at: now(), updated_at: now(), user_agent: req.headers['user-agent'] || '',
+  }
+  await insert('signup_requests', row)
+  return { row }
+}
+
+app.post('/api/auth/signup', async (req, res, next) => { try {
+  const result = await createSignupRequest(req, 'password')
+  if (result.error) return res.status(400).json({ error: result.error })
+  res.status(201).json({ ok: true, request_id: result.row.id, message: 'Registration submitted for administrator approval.' })
+} catch (e) { next(e) } })
+app.post('/api/auth/signup/oauth/prepare', async (req, res, next) => { try {
+  const result = await createSignupRequest(req, 'oauth')
+  if (result.error) return res.status(400).json({ error: result.error })
+  res.status(201).json({ ok: true, request_id: result.row.id })
+} catch (e) { next(e) } })
+
+app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
+  const settings = oauthSettings(req.params.provider, req), intent = req.query.intent === 'signup' ? 'signup' : 'login'
+  if (!settings) return res.redirect(landingRedirect(req, 'oauth_error', 'Unsupported sign-in provider.'))
+  if (!settings.clientId || !settings.clientSecret) return res.redirect(landingRedirect(req, 'oauth_error', `${settings.label} sign-in is not configured yet.`))
+  const requestId = String(req.query.request_id || '')
+  if (intent === 'signup') {
+    const signup = await one('signup_requests', { id: requestId })
+    if (!signup || signup.status !== 'oauth_pending') return res.redirect(landingRedirect(req, 'oauth_error', 'The social signup request is missing or expired.'))
+  }
+  const state = { id: randomUUID(), provider: settings.provider, intent, signup_request_id: requestId, used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
+  await insert('oauth_states', state)
+  const url = new URL(settings.authorizeUrl)
+  url.search = new URLSearchParams({ client_id: settings.clientId, redirect_uri: settings.redirectUri, response_type: 'code', scope: settings.scope, state: state.id, prompt: 'select_account' }).toString()
+  res.redirect(url.toString())
+} catch (e) { next(e) } })
+
+app.get('/api/auth/oauth/:provider/callback', async (req, res) => {
+  const settings = oauthSettings(req.params.provider, req)
+  try {
+    if (!settings) throw new Error('Unsupported sign-in provider.')
+    if (req.query.error) throw new Error(String(req.query.error_description || req.query.error))
+    const state = await consumeTransient('oauth_states', String(req.query.state || ''), { provider: settings.provider })
+    if (!state) throw new Error('The sign-in request is invalid or expired.')
+    const identity = await exchangeOAuthCode(settings, String(req.query.code || ''))
+    let user = await findIamUserForOAuth(identity)
+    if (state.intent === 'signup') {
+      if (user) throw new Error('An approved account already exists for this email. Please log in instead.')
+      const signup = await one('signup_requests', { id: state.signup_request_id })
+      if (!signup || signup.status !== 'oauth_pending') throw new Error('The signup request is no longer available.')
+      const duplicates = await list('signup_requests')
+      if (duplicates.some((row) => row.id !== signup.id && ['pending', 'oauth_pending'].includes(row.status) && row.email_key === identity.email)) throw new Error('An open request already exists for this verified email.')
+      const patch = { email: identity.email, email_key: identity.email, full_name: signup.full_name || identity.name, oauth_provider: identity.provider, oauth_subject: identity.subject, oauth_picture: identity.picture, status: 'pending', verified_at: now(), updated_at: now() }
+      await update('signup_requests', { id: signup.id }, patch)
+      return res.redirect(landingRedirect(req, 'signup_status', 'pending'))
+    }
+    if (!user || user.active === false) throw new Error('No active IAM account matches this verified email. Submit a signup request first.')
+    if (!(user.auth_providers || []).some((provider) => provider.provider === identity.provider && provider.subject === identity.subject)) {
+      const authProviders = [...(user.auth_providers || []).filter((provider) => provider.provider !== identity.provider), { provider: identity.provider, subject: identity.subject, email: identity.email, linked_at: now() }]
+      const profile = { ...(user.profile || {}), email: identity.email, email_key: identity.email, full_name: user.profile?.full_name || identity.name, picture: identity.picture || user.profile?.picture || '' }
+      await update('iam_users', { id: user.id }, { auth_providers: authProviders, profile, updated_at: now() })
+      user = { ...user, auth_providers: authProviders, profile }
+    }
+    const device = await recordLogin(req, user, identity.provider)
+    const ticket = { id: randomUUID(), user_id: user.id, device_id: device.id, used: false, created_at: now(), expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() }
+    await insert('oauth_tickets', ticket)
+    res.redirect(landingRedirect(req, 'oauth_ticket', ticket.id))
+  } catch (error) { res.redirect(landingRedirect(req, 'oauth_error', readableError(error, 'Social sign-in failed.'))) }
+})
+
+app.post('/api/auth/oauth/exchange', async (req, res, next) => { try {
+  const ticket = await consumeTransient('oauth_tickets', String(req.body.ticket || ''))
+  if (!ticket) return res.status(401).json({ error: 'The social sign-in ticket is invalid or expired.' })
+  const user = await one('iam_users', { id: ticket.user_id })
+  if (!user || user.active === false) return res.status(401).json({ error: 'This IAM account is not active.' })
+  res.json({ token: sign(user, ticket.device_id), user: publicUser(user), deviceId: ticket.device_id })
+} catch (e) { next(e) } })
+
 app.post('/api/auth/pem/challenge', async (req, res, next) => { try {
   const key = usernameKey(req.body.username)
   const user = await one('iam_users', { username_key: key })
@@ -316,6 +513,40 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json(publicUser(user))
 })
 
+app.get('/api/iam/signup-requests', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
+  const rows = await list('signup_requests')
+  rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+  res.json(rows.map(publicSignupRequest))
+} catch (e) { next(e) } })
+app.post('/api/iam/signup-requests/:id/approve', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const signup = await one('signup_requests', { id: req.params.id })
+  if (!signup || signup.status !== 'pending') return res.status(404).json({ error: 'Pending signup request not found.' })
+  if (await one('iam_users', { username_key: signup.username_key })) return res.status(409).json({ error: 'That username already belongs to an IAM user.' })
+  if ((await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === signup.email_key)) return res.status(409).json({ error: 'That email already belongs to an IAM user.' })
+  if (signup.signup_method === 'password' && !signup.password_hash) return res.status(400).json({ error: 'This password registration no longer has valid credentials.' })
+  if (signup.signup_method === 'oauth' && (!signup.oauth_provider || !signup.oauth_subject)) return res.status(400).json({ error: 'Social signup verification is incomplete.' })
+  const profile = {
+    full_name: signup.full_name, email: signup.email, email_key: signup.email_key, phone: signup.phone, organization_name: signup.organization_name,
+    organization_type: signup.organization_type, job_title: signup.job_title, team_size: signup.team_size, website: signup.website,
+    city: signup.city, state: signup.state, country: signup.country, use_case: signup.use_case, how_heard: signup.how_heard, picture: signup.oauth_picture || '',
+  }
+  const row = {
+    id: randomUUID(), username: signup.requested_username, username_key: signup.username_key, role: 'viewer', permissions: VIEWER_FEATURES, active: true,
+    source: 'signup', password_hash: signup.password_hash || '', profile, signup_request_id: signup.id,
+    auth_providers: signup.oauth_provider ? [{ provider: signup.oauth_provider, subject: signup.oauth_subject, email: signup.email, linked_at: now() }] : [],
+    created_at: now(), created_by: req.user.user, updated_at: now(),
+  }
+  await insert('iam_users', row)
+  await update('signup_requests', { id: signup.id }, { status: 'approved', password_hash: '', approved_at: now(), approved_by: req.user.user, iam_user_id: row.id, updated_at: now() })
+  res.status(201).json(publicUser(row))
+} catch (e) { next(e) } })
+app.patch('/api/iam/signup-requests/:id/reject', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
+  const signup = await one('signup_requests', { id: req.params.id })
+  if (!signup || !['pending', 'oauth_pending'].includes(signup.status)) return res.status(404).json({ error: 'Open signup request not found.' })
+  await update('signup_requests', { id: signup.id }, { status: 'rejected', password_hash: '', rejected_at: now(), rejected_by: req.user.user, rejection_note: String(req.body.note || '').slice(0, 500), updated_at: now() })
+  res.json({ ok: true })
+} catch (e) { next(e) } })
+
 app.get('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
   await ensureEnvironmentAdmin()
   const users = await list('iam_users')
@@ -324,12 +555,15 @@ app.get('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (_req,
 } catch (e) { next(e) } })
 app.post('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
   const username = String(req.body.username || '').trim(), key = usernameKey(username), password = String(req.body.password || '')
+  const email = String(req.body.email || '').trim().toLocaleLowerCase()
   const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' })
   if (password.length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address for social login.' })
   if (await one('iam_users', { username_key: key })) return res.status(409).json({ error: 'That username already exists.' })
+  if (email && (await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
   const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
-  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', password_hash: await bcrypt.hash(password, 12), created_at: now(), created_by: req.user.user, updated_at: now() }
+  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', password_hash: await bcrypt.hash(password, 12), profile: email ? { email, email_key: email } : {}, created_at: now(), created_by: req.user.user, updated_at: now() }
   await insert('iam_users', row)
   res.status(201).json(publicUser(row))
 } catch (e) { next(e) } })
@@ -339,9 +573,12 @@ app.patch('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async 
   if (user.source === 'environment') return res.status(400).json({ error: 'The environment administrator is managed through Vercel environment variables.' })
   const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : user.role
   const active = req.body.active === undefined ? user.active !== false : Boolean(req.body.active)
+  const email = req.body.email === undefined ? String(user.profile?.email || '') : String(req.body.email || '').trim().toLocaleLowerCase()
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address for social login.' })
+  if (email && (await list('iam_users')).some((row) => row.id !== user.id && usernameKey(row.profile?.email || row.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
   if (user.id === req.user.user_id && (role !== 'admin' || !active)) return res.status(400).json({ error: 'You cannot remove your own administrator access.' })
   const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
-  const patch = { role, active, permissions, updated_at: now(), updated_by: req.user.user }
+  const patch = { role, active, permissions, profile: { ...(user.profile || {}), email, email_key: email }, updated_at: now(), updated_by: req.user.user }
   if (req.body.password) {
     if (String(req.body.password).length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
     patch.password_hash = await bcrypt.hash(String(req.body.password), 12)
@@ -392,13 +629,6 @@ function saleFromBody(body) {
     ...(body.passbook_source ? { passbook_source: clean(body.passbook_source) } : {}),
   }
 }
-app.post('/api/public/sales', async (req, res, next) => { try {
-  const row = saleFromBody(req.body)
-  if (!row.customer_name || row.selling_price <= 0) return res.status(400).json({ error: 'Customer name and a valid selling price are required.' })
-  row.id = await nextId('sales'); row.created_at = new Date().toISOString(); row.source = 'public'
-  await insert('sales', row); res.status(201).json(row)
-} catch (e) { next(e) } })
-
 app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (_req, res, next) => { try {
   const rows = await list('sales'); rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date))); res.json(rows)
 } catch (e) { next(e) } })

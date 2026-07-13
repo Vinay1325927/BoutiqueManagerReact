@@ -24,11 +24,36 @@ Import this repository into Vercel. The included `vercel.json` builds the Vite f
 
 Add every required value from `.env.example` under **Project Settings → Environment Variables**. At minimum configure `MONGO_URI`, `MONGO_DB`, `JWT_SECRET`, `BRIDGE_SECRET`, `USERNAME`, and either `PASSWORD` or `PASSWORD_HASH`.
 
+### Google and Microsoft login
+
+Create OAuth applications with Google and Microsoft, then add these server-only Vercel variables:
+
+```text
+ADMIN_EMAIL=admin@your-company.com
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+MICROSOFT_CLIENT_ID=...
+MICROSOFT_CLIENT_SECRET=...
+MICROSOFT_TENANT_ID=common
+OAUTH_REDIRECT_BASE=https://your-production-domain.vercel.app
+```
+
+Register these exact callback URLs with the providers, replacing the domain with `OAUTH_REDIRECT_BASE`:
+
+```text
+https://your-production-domain.vercel.app/api/auth/oauth/google/callback
+https://your-production-domain.vercel.app/api/auth/oauth/microsoft/callback
+```
+
+`ADMIN_EMAIL` links the environment administrator to a social identity. Other users can submit a detailed Google, Microsoft, or password signup request. An administrator must approve it in **IAM → Signup approval queue** before login is allowed. Approved registrations start as Viewer accounts; an administrator can then change their role or selected feature access.
+
 Passbook extraction and bill PDF generation are handled by `server/python_bridge.py`. Local development uses `.venv`; Vercel installs the minimal packages from `requirements.txt` for `api/pdf.py`.
 
 ## Included workflows
 
-- Public sale entry and protected admin login
+- Public product landing page with detailed password, Google, and Microsoft signup
+- Password, Google, Microsoft, and browser-generated PEM login
+- MongoDB-backed IAM with Admin, Custom access, and Viewer roles
 - Sales CRUD and partial-payment collection
 - Customer and vendor summaries
 - Billing with downloadable PDF invoices

@@ -48,6 +48,7 @@ async function connectDb() {
       database.collection('auth_devices').updateMany({ workspace_id: { $exists: false } }, { $set: { workspace_id: 'platform' } }),
     ])
     await ensureEnvironmentAdmin()
+    await ensurePersonalBoutique()
     console.log(`MongoDB connected: ${database.databaseName}`)
     return database
   })().catch((error) => { databasePromise = null; throw error })
@@ -190,6 +191,69 @@ async function ensureEnvironmentAdmin() {
     })
   }
   return administrator
+}
+
+async function sharedBoutiquePasswordHash(existingHash = '') {
+  const configuredHash = String(process.env.PASSWORD_HASH || '').trim()
+  if (configuredHash) return configuredHash
+  const password = String(process.env.PASSWORD || '')
+  if (!password) return existingHash
+  if (existingHash) {
+    try { if (await bcrypt.compare(password, existingHash)) return existingHash } catch { /* replace an invalid legacy hash */ }
+  }
+  return bcrypt.hash(password, 12)
+}
+
+async function ensurePersonalBoutique() {
+  const username = String(process.env.BOUTIQUE_USERNAME || '').trim()
+  const businessName = String(process.env.BOUTIQUE_NAME || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+  if (!username && !businessName) return null
+  if (!username || !businessName) throw new Error('Configure both BOUTIQUE_USERNAME and BOUTIQUE_NAME.')
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) throw new Error('BOUTIQUE_USERNAME must use only letters, numbers, dots, dashes or underscores.')
+  const key = usernameKey(username)
+  if (key === usernameKey(process.env.USERNAME || 'Admin') || key === 'admin') throw new Error('BOUTIQUE_USERNAME must be different from the platform administrator.')
+
+  const users = await list('iam_users')
+  let user = users.find((row) => row.username_key === key) || null
+  if (user?.source === 'signup' || user?.platform_admin || user?.source === 'environment') throw new Error('BOUTIQUE_USERNAME already belongs to another protected account.')
+
+  let workspace = user?.workspace_id && user.workspace_id !== 'platform' ? await one('workspaces', { id: user.workspace_id }) : null
+  if (!workspace) workspace = await one('workspaces', { kind: 'personal_boutique' })
+  const createdAt = user?.created_at || workspace?.created_at || now(), workspaceId = workspace?.id || randomUUID(), userId = user?.id || randomUUID()
+  const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLocaleLowerCase()
+  const existingEmail = String(user?.profile?.email || '').trim().toLocaleLowerCase()
+  const profile = {
+    ...(user?.profile || {}), full_name: user?.profile?.full_name || businessName,
+    organization_name: businessName, organization_type: user?.profile?.organization_type || 'Boutique',
+    ...(adminEmail && existingEmail === adminEmail ? { email: '', email_key: '' } : {}),
+  }
+  const passwordHash = await sharedBoutiquePasswordHash(user?.password_hash || '')
+  if (!passwordHash) throw new Error('Configure PASSWORD or PASSWORD_HASH before creating the personal boutique account.')
+
+  const workspacePatch = {
+    id: workspaceId, kind: 'personal_boutique', name: businessName, active: true, plan: workspace?.plan || 'owner', owner_user_id: userId,
+    profile, signup_method: 'shared_password', updated_at: now(), created_at: workspace?.created_at || createdAt,
+  }
+  if (workspace) await update('workspaces', { id: workspace.id }, workspacePatch)
+  else await insert('workspaces', workspacePatch)
+
+  const userPatch = {
+    username, username_key: key, role: 'owner', permissions: OWNER_FEATURES, active: true, source: 'personal_boutique', platform_admin: false,
+    workspace_id: workspaceId, signup_method: 'shared_password', password_hash: passwordHash, profile,
+    auth_providers: user?.source === 'personal_boutique' ? (user.auth_providers || []) : [], updated_at: now(),
+  }
+  if (user) await update('iam_users', { id: user.id }, userPatch)
+  else {
+    user = { id: userId, ...userPatch, created_at: createdAt, created_by: 'environment_bootstrap' }
+    await insert('iam_users', user)
+  }
+
+  if (database) {
+    await Promise.all(BUSINESS_COLLECTIONS.map((name) => database.collection(name).updateMany({ workspace_id: 'platform' }, { $set: { workspace_id: workspaceId } })))
+  } else {
+    for (const name of BUSINESS_COLLECTIONS) for (const row of memory.get(name) || []) if (row.workspace_id === 'platform') row.workspace_id = workspaceId
+  }
+  return { user: { ...user, ...userPatch }, workspace: { ...workspace, ...workspacePatch } }
 }
 
 function workspaceName(profile = {}, username = '') {
@@ -449,6 +513,7 @@ async function auth(req, res, next) {
 }
 
 function canAccess(user, feature, write = false) {
+  if (user.platform_admin) return feature === 'platform'
   if (user.role === 'admin') return true
   if (user.role === 'owner') return OWNER_FEATURES.includes(feature)
   if (user.role === 'viewer') return !write && VIEWER_FEATURES.includes(feature)
@@ -457,6 +522,7 @@ function canAccess(user, feature, write = false) {
 
 function permit(feature, { write = false, adminOnly = false } = {}) {
   return (req, res, next) => {
+    if (req.user.platform_admin && feature !== 'platform') return res.status(403).json({ error: 'The platform administrator is limited to the Customer Accounts console.' })
     if (adminOnly && req.user.role !== 'admin') return res.status(403).json({ error: 'Administrator access is required.' })
     if (!adminOnly && !canAccess(req.user, feature, write)) return res.status(403).json({ error: write ? 'You do not have permission to change this feature.' : 'You do not have access to this feature.' })
     next()
@@ -465,6 +531,7 @@ function permit(feature, { write = false, adminOnly = false } = {}) {
 
 function permitAny(features, { write = false } = {}) {
   return (req, res, next) => {
+    if (req.user.platform_admin) return res.status(403).json({ error: 'The platform administrator is limited to the Customer Accounts console.' })
     if (!features.some((feature) => canAccess(req.user, feature, write))) return res.status(403).json({ error: 'You do not have permission to perform this action.' })
     next()
   }
@@ -495,6 +562,10 @@ app.post('/api/auth/login', async (req, res) => {
   const password = String(req.body.password || '')
   const expectedUser = process.env.USERNAME || 'Admin'
   let user = await one('iam_users', { username_key: usernameKey(username) })
+  if (!user && usernameKey(username) === usernameKey(process.env.BOUTIQUE_USERNAME || '')) {
+    await ensurePersonalBoutique()
+    user = await one('iam_users', { username_key: usernameKey(username) })
+  }
   let validPassword = false
   if (usernameKey(username) === usernameKey(expectedUser)) {
     if (process.env.VERCEL && !process.env.PASSWORD && !process.env.PASSWORD_HASH) {

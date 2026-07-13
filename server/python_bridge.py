@@ -7,31 +7,11 @@ in the Node API. Heavy PDF work uses focused Python PDF libraries.
 import base64
 import io
 import json
-import os
 import re
 import sys
 from datetime import date, datetime
 from html import escape as html_escape
 from urllib.parse import quote
-
-
-BRAND_NAME = "Shree Krishna Boutique"
-UPI_ID = "9176619942@ybl"
-PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
-SYMBOL_PATH = next(
-    (
-        path
-        for path in (
-            os.path.join(PROJECT_ROOT, "public", "krishna_symbol.png"),
-            os.path.join(PROJECT_ROOT, "dist", "krishna_symbol.png"),
-            os.path.join(os.getcwd(), "public", "krishna_symbol.png"),
-            os.path.join(os.getcwd(), "dist", "krishna_symbol.png"),
-        )
-        if os.path.exists(path)
-    ),
-    "",
-)
-
 
 def clean(value):
     if value is None:
@@ -194,9 +174,9 @@ def parse_passbook(file_data):
     }
 
 
-def upi_qr(pending):
+def upi_qr(pending, upi_id, brand_name):
     import qrcode
-    uri = f"upi://pay?pa={quote(UPI_ID)}&pn={quote(BRAND_NAME)}&cu=INR"
+    uri = f"upi://pay?pa={quote(upi_id)}&pn={quote(brand_name)}&cu=INR"
     if pending > 0:
         uri += f"&am={pending:.2f}"
     qr = qrcode.QRCode(box_size=8, border=2)
@@ -233,6 +213,8 @@ def generate_bill(payload):
     bill_id = payload["bill_id"]
     bill_date = payload.get("bill_date") or str(date.today())
     scope_label = payload.get("bill_scope_label") or "All Transactions"
+    business_name = clean(payload.get("business_name")) or "Boutique Cloud"
+    upi_id = clean(payload.get("upi_id"))
     total_bill = sum(amount(row.get("selling_price")) for row in rows)
     total_paid = sum(amount(row.get("amount_paid")) for row in rows)
     total_pending = sum(amount(row.get("pending_amount")) for row in rows)
@@ -246,10 +228,14 @@ def generate_bill(payload):
     right_style = ParagraphStyle("Right", parent=styles["Normal"], fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor("#475569"))
     center_style = ParagraphStyle("Center", parent=styles["Normal"], fontSize=9, alignment=TA_CENTER, textColor=colors.HexColor("#0F172A"))
     story = []
-    symbol = Image(SYMBOL_PATH, width=20*mm, height=20*mm) if os.path.exists(SYMBOL_PATH) else Paragraph("<b>SK</b>", center_style)
-    brand = Table([[symbol, [Paragraph(BRAND_NAME, title_style), Paragraph("Customer Purchase Bill", sub_style)]]], colWidths=[24*mm, 88*mm])
+    initials = "".join(word[0] for word in business_name.split()[:2]).upper() or "BC"
+    symbol = Paragraph(f"<b>{html_escape(initials)}</b>", center_style)
+    brand = Table([[symbol, [Paragraph(html_escape(business_name), title_style), Paragraph("Customer Purchase Bill", sub_style)]]], colWidths=[24*mm, 88*mm])
     brand.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0)]))
-    header = Table([[brand, [Paragraph(f"<b>Bill ID:</b> {html_escape(bill_id)}",right_style),Paragraph(f"<b>Bill Date:</b> {display_date(bill_date)}",right_style),Paragraph(f"<b>UPI:</b> {UPI_ID}",right_style)]]], colWidths=[112*mm,56*mm])
+    header_details = [Paragraph(f"<b>Bill ID:</b> {html_escape(bill_id)}",right_style),Paragraph(f"<b>Bill Date:</b> {display_date(bill_date)}",right_style)]
+    if upi_id:
+        header_details.append(Paragraph(f"<b>UPI:</b> {html_escape(upi_id)}",right_style))
+    header = Table([[brand, header_details]], colWidths=[112*mm,56*mm])
     header.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("BOTTOMPADDING",(0,0),(-1,-1),8),("LINEBELOW",(0,0),(-1,-1),.6,colors.HexColor("#CBD5E1"))]))
     story.extend([header, Spacer(1,8)])
     customer_block = Table([[Paragraph(f"<b>Customer:</b> {html_escape(customer)}",sub_style),Paragraph(f"<b>Phone:</b> {html_escape(phone or '-')}",sub_style),Paragraph(f"<b>Bill ID:</b> {html_escape(bill_id)}",sub_style),Paragraph(f"<b>Type:</b> {html_escape(scope_label)}",sub_style)]],colWidths=[54*mm,36*mm,42*mm,36*mm])
@@ -265,7 +251,11 @@ def generate_bill(payload):
     purchase_table = Table(table_data,colWidths=[22*mm,76*mm,22*mm,22*mm,25*mm,22*mm],repeatRows=1)
     purchase_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EAF1FF")),("TEXTCOLOR",(0,0),(-1,0),colors.HexColor("#0F172A")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#CBD5E1")),("VALIGN",(0,0),(-1,-1),"TOP"),("ALIGN",(2,1),(3,-1),"RIGHT"),("ALIGN",(5,1),(5,-1),"CENTER"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F8FAFC")]),("PADDING",(0,0),(-1,-1),5)]))
     story.extend([purchase_table,Spacer(1,10)])
-    totals = Table([[Image(upi_qr(total_pending),width=34*mm,height=34*mm),[Paragraph("<b>PhonePe / UPI Payment</b>",sub_style),Paragraph(f"UPI ID: {UPI_ID}",sub_style),Paragraph(f"QR amount: Rs {total_pending:,.2f}" if total_pending>0 else "No pending amount",sub_style)],[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style)]]],colWidths=[38*mm,62*mm,68*mm])
+    if upi_id:
+        payment_block = [Image(upi_qr(total_pending, upi_id, business_name),width=34*mm,height=34*mm),[Paragraph("<b>UPI Payment</b>",sub_style),Paragraph(f"UPI ID: {html_escape(upi_id)}",sub_style),Paragraph(f"QR amount: Rs {total_pending:,.2f}" if total_pending>0 else "No pending amount",sub_style)]]
+        totals = Table([[*payment_block,[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style)]]],colWidths=[38*mm,62*mm,68*mm])
+    else:
+        totals = Table([[Paragraph("Payment summary",sub_style),[Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}",right_style),Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}",right_style),Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}",right_style)]]],colWidths=[100*mm,68*mm])
     totals.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.7,colors.HexColor("#CBD5E1")),("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F8FAFC")),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("PADDING",(0,0),(-1,-1),8)]))
     story.extend([totals,Spacer(1,8)])
     if total_pending>0:

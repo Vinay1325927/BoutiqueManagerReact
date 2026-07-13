@@ -4,10 +4,7 @@
   "outputDirectory": "dist",
   "functions": {
     "api/index.js": { "maxDuration": 300 },
-    "api/pdf.py": {
-      "maxDuration": 300,
-      "includeFiles": "public/krishna_symbol.png"
-    }
+    "api/pdf.py": { "maxDuration": 300 }
   },
   "rewrites": [
     { "source": "/pdf-service", "destination": "/api/pdf" },

@@ -1,6 +1,8 @@
-# Shree Krishna Boutique — React edition
+# Boutique Cloud
 
-A React single-page application with an Express API and focused Python PDF services. MongoDB and AI credentials remain server-side.
+A public, multi-tenant boutique operations product built with React, Express, MongoDB, and focused Python PDF services.
+
+Every public signup immediately creates a private workspace and signs its owner in. Business collections are scoped by `workspace_id`, so one customer cannot read or change another customer’s sales, notes, bills, vendors, passbook records, or AI context.
 
 ## Run locally
 
@@ -10,23 +12,31 @@ npm install
 npm run dev
 ```
 
-`npm run dev` automatically creates a small `.venv` containing only the passbook and billing PDF packages. Streamlit is not installed.
+Open `http://localhost:5173`; the API runs on `http://localhost:8787`. Without `MONGO_URI`, local development uses temporary in-memory storage. `npm run dev` creates a small Python environment containing only the passbook and billing packages.
 
-Open `http://localhost:5173`. The API runs on `http://localhost:8787`.
-
-Without `MONGO_URI`, the local API uses temporary in-memory storage so the application can be previewed. For persistent data, set `MONGO_URI` and `MONGO_DB` in `.env`.
-
-The development login defaults to `admin` / `admin` when neither `PASSWORD` nor `PASSWORD_HASH` is configured. Always set `JWT_SECRET`, `USERNAME`, and a production password before deployment.
+The local administrator defaults to `Admin` / `admin` only when no password is configured. Production fails closed if neither `PASSWORD` nor `PASSWORD_HASH` is present.
 
 ## Deploy to Vercel
 
-Import this repository into Vercel. The included `vercel.json` builds the Vite frontend, deploys Express as a Node.js Function, and deploys passbook/bill processing as a separate Python Function.
+Import the repository and add the values from `.env.example` under **Project Settings → Environment Variables**. Required production values are:
 
-Add every required value from `.env.example` under **Project Settings → Environment Variables**. At minimum configure `MONGO_URI`, `MONGO_DB`, `JWT_SECRET`, `BRIDGE_SECRET`, `USERNAME`, and either `PASSWORD` or `PASSWORD_HASH`.
+```text
+MONGO_URI=...
+MONGO_DB=boutique_db
+JWT_SECRET=...
+BRIDGE_SECRET=...
+USERNAME=Admin
+PASSWORD=...
+SMTP_ENCRYPTION_KEY=...
+```
+
+Keep the platform password and all other secrets in Vercel; never commit them. The account named by `USERNAME` is the only platform administrator. It receives the private **Customer accounts** console with registration details, workspace status, activity, record counts, revenue, pending value, login history, and estimated MongoDB document usage. Stale environment administrators are disabled automatically.
+
+Public password signups require contact, organisation, and location details. There is no approval queue: successful signup creates a workspace owner account immediately. Customer owners never see the platform console, internal IAM, security devices, SMTP credentials, or other workspaces.
 
 ### Google and Microsoft login
 
-Create OAuth applications with Google and Microsoft, then add these server-only Vercel variables:
+Configure these server-only variables when social login is required:
 
 ```text
 ADMIN_EMAIL=admin@your-company.com
@@ -38,38 +48,32 @@ MICROSOFT_TENANT_ID=common
 OAUTH_REDIRECT_BASE=https://your-production-domain.vercel.app
 ```
 
-Register these exact callback URLs with the providers, replacing the domain with `OAUTH_REDIRECT_BASE`:
+Register these callbacks with the providers:
 
 ```text
 https://your-production-domain.vercel.app/api/auth/oauth/google/callback
 https://your-production-domain.vercel.app/api/auth/oauth/microsoft/callback
 ```
 
-`ADMIN_EMAIL` links the environment administrator to a social identity. **Continue with Google/Microsoft** is a unified flow: an approved email signs in immediately; a new email returns to a prefilled questionnaire and becomes a pending IAM request after submission. An administrator must approve it in **IAM → Signup approval queue** before login is allowed. Approved registrations start as Viewer accounts; an administrator can then change their role or selected feature access.
+An existing verified identity signs in. A new identity completes the remaining organisation questions, then receives its private workspace immediately.
 
-### Gmail / SMTP email
+### Gmail / SMTP
 
-Set a stable `SMTP_ENCRYPTION_KEY` in Vercel, redeploy, then open **Technical → Outgoing email · SMTP** as an administrator. Gmail requires 2-Step Verification and a Google App Password; do not enter the normal Google account password. The app password is AES-256-GCM encrypted before it is stored in MongoDB. The Technical page includes a send-test action and also supports custom SMTP hosts.
+Set a stable `SMTP_ENCRYPTION_KEY`, redeploy, then use **Technical → Outgoing email · SMTP** from the platform administrator account. Gmail requires 2-Step Verification and a Google App Password. SMTP passwords are AES-256-GCM encrypted before MongoDB storage.
 
-Passbook extraction and bill PDF generation are handled by `server/python_bridge.py`. Local development uses `.venv`; Vercel installs the minimal packages from `requirements.txt` for `api/pdf.py`.
+## Main workflows
 
-## Included workflows
-
-- Public product landing page with detailed password, Google, and Microsoft signup
-- Password, Google, Microsoft, and browser-generated PEM login
-- MongoDB-backed IAM with Admin, Custom access, and Viewer roles
-- Sales CRUD and partial-payment collection
-- Customer and vendor summaries
-- Billing with downloadable PDF invoices
-- Revenue, profit, category, customer, and payment analytics
-- Pending-payment reminders
-- Passbook PDF text extraction
-- Work notes
-- Gemini or OpenAI business assistant
-- Device-session review and revocation
-- Complete JSON backup and additive restore
-- Excel account export
+- Immediate public password, Google, and Microsoft signup
+- Tenant-isolated MongoDB business data
+- Platform-only customer and usage console
+- Sales and repeat-customer orders
+- Collections, customers, vendors, analytics, and reminders
+- Downloadable PDF bills and permanent bill history
+- Python passbook PDF extraction
+- Work notes and AI business assistant
+- Internal Custom and Viewer support identities
+- Browser-generated PEM login and device revocation
+- JSON backup/restore and Excel exports
 - Responsive light and dark interfaces
 
 The application entry points are `src/main.jsx`, `api/index.js`, and `api/pdf.py`.
-# BoutiqueManagerReact

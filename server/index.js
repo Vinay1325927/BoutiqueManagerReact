@@ -27,7 +27,8 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const collections = ['sales', 'work_notes', 'bill_history', 'auth_devices', 'app_settings', 'passbook_vendors', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets']
+const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors']
+const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets']
 const backupCollections = collections.filter((name) => !['auth_challenges', 'oauth_states', 'oauth_tickets'].includes(name))
 for (const name of collections) memory.set(name, [])
 
@@ -42,6 +43,11 @@ async function connectDb() {
     const client = new MongoClient(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     await client.connect()
     database = client.db(process.env.MONGO_DB || 'boutique_db')
+    await Promise.all([
+      ...BUSINESS_COLLECTIONS.map((name) => database.collection(name).updateMany({ workspace_id: { $exists: false } }, { $set: { workspace_id: 'platform' } })),
+      database.collection('auth_devices').updateMany({ workspace_id: { $exists: false } }, { $set: { workspace_id: 'platform' } }),
+    ])
+    await ensureEnvironmentAdmin()
     console.log(`MongoDB connected: ${database.databaseName}`)
     return database
   })().catch((error) => { databasePromise = null; throw error })
@@ -129,8 +135,9 @@ async function readTransient(name, id, match = {}) {
   return clean(row)
 }
 
-const FEATURE_IDS = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai', 'technical', 'backup']
-const CUSTOM_FEATURE_IDS = FEATURE_IDS.filter((id) => id !== 'backup')
+const OWNER_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
+const FEATURE_IDS = [...OWNER_FEATURES, 'technical', 'backup', 'platform']
+const CUSTOM_FEATURE_IDS = OWNER_FEATURES
 const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
 const now = () => new Date().toISOString()
@@ -141,9 +148,11 @@ function publicUser(row) {
     id: row.id,
     username: row.username,
     role: row.role,
-    permissions: row.role === 'admin' ? FEATURE_IDS : row.role === 'viewer' ? VIEWER_FEATURES : (row.permissions || []).filter((id) => CUSTOM_FEATURE_IDS.includes(id)),
+    permissions: row.role === 'admin' ? FEATURE_IDS : row.role === 'owner' ? OWNER_FEATURES : row.role === 'viewer' ? VIEWER_FEATURES : (row.permissions || []).filter((id) => CUSTOM_FEATURE_IDS.includes(id)),
     active: row.active !== false,
     source: row.source || 'managed',
+    platform_admin: row.source === 'environment' || row.platform_admin === true,
+    workspace_id: row.workspace_id || '',
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_login_at: row.last_login_at,
@@ -157,27 +166,68 @@ function publicUser(row) {
   }
 }
 
-function publicSignupRequest(row) {
-  if (!row) return null
-  const { password_hash: _passwordHash, ...safe } = row
-  return safe
-}
-
 async function ensureEnvironmentAdmin() {
-  const username = String(process.env.USERNAME || 'admin').trim()
+  const username = String(process.env.USERNAME || 'Admin').trim()
   const key = usernameKey(username)
-  const existing = await one('iam_users', { username_key: key })
+  const environmentUsers = await list('iam_users', { source: 'environment' })
+  const existing = environmentUsers.find((row) => row.username_key === key) || environmentUsers[0] || null
   const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLocaleLowerCase()
   const profile = adminEmail ? { ...(existing?.profile || {}), email: adminEmail, email_key: adminEmail } : (existing?.profile || {})
-  const patch = { username, username_key: key, role: 'admin', permissions: FEATURE_IDS, active: true, source: 'environment', profile, updated_at: now() }
+  const patch = { username, username_key: key, role: 'admin', permissions: FEATURE_IDS, active: true, source: 'environment', platform_admin: true, workspace_id: 'platform', profile, updated_at: now() }
+  let administrator
   if (existing) {
     await update('iam_users', { id: existing.id }, patch)
-    return { ...existing, ...patch }
+    administrator = { ...existing, ...patch }
+  } else {
+    administrator = { id: randomUUID(), ...patch, created_at: now(), created_by: 'environment' }
+    await insert('iam_users', administrator)
   }
-  const row = { id: randomUUID(), ...patch, created_at: now(), created_by: 'environment' }
-  await insert('iam_users', row)
-  return row
+  const users = await list('iam_users')
+  for (const user of users.filter((row) => row.id !== administrator.id && (row.role === 'admin' || row.platform_admin || row.source === 'environment'))) {
+    await update('iam_users', { id: user.id }, {
+      role: 'custom', permissions: CUSTOM_FEATURE_IDS, platform_admin: false, active: false,
+      source: user.source === 'environment' ? 'managed' : user.source, updated_at: now(), updated_by: 'environment',
+    })
+  }
+  return administrator
 }
+
+function workspaceName(profile = {}, username = '') {
+  return String(profile.organization_name || `${profile.full_name || username || 'New'} workspace`).replace(/\s+/g, ' ').trim().slice(0, 160)
+}
+
+async function ensureUserWorkspace(user) {
+  if (!user) return null
+  if (user.source === 'environment' || user.platform_admin) {
+    if (user.workspace_id === 'platform') return user
+    const patch = { workspace_id: 'platform', platform_admin: true, role: 'admin', permissions: FEATURE_IDS, updated_at: now() }
+    await update('iam_users', { id: user.id }, patch)
+    return { ...user, ...patch }
+  }
+  if (user.workspace_id) return user
+  if (user.source !== 'signup') {
+    const patch = { workspace_id: 'platform', updated_at: now() }
+    await update('iam_users', { id: user.id }, patch)
+    return { ...user, ...patch }
+  }
+  const workspaceId = randomUUID(), profile = user.profile || {}
+  const workspace = {
+    id: workspaceId, name: workspaceName(profile, user.username), active: user.active !== false, plan: 'free', owner_user_id: user.id,
+    profile: clean(profile), signup_method: user.signup_method || 'password', created_at: user.created_at || now(), updated_at: now(),
+  }
+  await insert('workspaces', workspace)
+  const patch = { workspace_id: workspaceId, role: 'owner', permissions: OWNER_FEATURES, updated_at: now() }
+  await update('iam_users', { id: user.id }, patch)
+  return { ...user, ...patch }
+}
+
+async function workspaceIsActive(user) {
+  if (!user || user.workspace_id === 'platform' || user.platform_admin || user.source === 'environment') return true
+  const workspace = await one('workspaces', { id: user.workspace_id })
+  return Boolean(workspace && workspace.active !== false)
+}
+
+const workspaceQuery = (req, query = {}) => ({ ...query, workspace_id: req.user.workspace_id || 'platform' })
 
 function requestOrigin(req) {
   const configured = String(process.env.OAUTH_REDIRECT_BASE || '').replace(/\/$/, '')
@@ -266,7 +316,7 @@ function decryptSecret(value) {
 function publicSmtp(value = {}) {
   return {
     provider: value.provider || 'gmail', enabled: value.enabled === true, host: value.host || 'smtp.gmail.com', port: Number(value.port || 465),
-    secure: value.secure !== false, user: value.user || '', from_name: value.from_name || 'Shree Krishna Boutique', from_email: value.from_email || '',
+    secure: value.secure !== false, user: value.user || '', from_name: value.from_name || 'Boutique Cloud', from_email: value.from_email || '',
     reply_to: value.reply_to || '', password_configured: Boolean(value.password_encrypted), updated_at: value.updated_at || '', updated_by: value.updated_by || '',
   }
 }
@@ -283,7 +333,7 @@ function smtpInput(body, old = {}) {
   if (!password && !old.password_encrypted) return { error: provider === 'gmail' ? 'Enter a Google App Password.' : 'Enter the SMTP password.' }
   return { value: {
     provider, enabled: body.enabled !== false, host, port, secure: body.secure !== false, user,
-    from_name: String(body.from_name || 'Shree Krishna Boutique').replace(/[\r\n]/g, ' ').trim().slice(0, 120), from_email: fromEmail, reply_to: replyTo,
+    from_name: String(body.from_name || 'Boutique Cloud').replace(/[\r\n]/g, ' ').trim().slice(0, 120), from_email: fromEmail, reply_to: replyTo,
     password_encrypted: password ? encryptSecret(provider === 'gmail' ? password.replace(/\s/g, '') : password) : old.password_encrypted,
   } }
 }
@@ -301,7 +351,7 @@ async function sendConfiguredEmail({ to, subject, text, html }, { allowDisabled 
   const settings = await one('app_settings', { id: 'global' }), smtp = settings?.smtp
   if (!smtp?.enabled && !allowDisabled) throw new Error('SMTP email sending is not enabled.')
   const transporter = smtpTransport(smtp)
-  return transporter.sendMail({ from: { name: smtp.from_name || 'Shree Krishna Boutique', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html })
+  return transporter.sendMail({ from: { name: smtp.from_name || 'Boutique Cloud', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html })
 }
 
 function smtpErrorMessage(error) {
@@ -377,7 +427,7 @@ app.use(async (_req, _res, next) => {
 })
 
 function sign(user, deviceId) {
-  return jwt.sign({ user: user.username, user_id: user.id, role: user.role, permissions: publicUser(user).permissions, device_id: deviceId }, jwtSecret, { expiresIn: '12h' })
+  return jwt.sign({ user: user.username, user_id: user.id, workspace_id: user.workspace_id, role: user.role, permissions: publicUser(user).permissions, device_id: deviceId }, jwtSecret, { expiresIn: '12h' })
 }
 
 async function auth(req, res, next) {
@@ -386,19 +436,21 @@ async function auth(req, res, next) {
     const payload = jwt.verify(token, jwtSecret)
     let user
     if (payload.user_id) user = await one('iam_users', { id: payload.user_id })
-    else if (payload.role === 'admin' && usernameKey(payload.user) === usernameKey(process.env.USERNAME || 'admin')) user = await ensureEnvironmentAdmin()
-    if (!user || user.active === false) return res.status(401).json({ error: 'This account is inactive or no longer exists.' })
+    else if (payload.role === 'admin' && usernameKey(payload.user) === usernameKey(process.env.USERNAME || 'Admin')) user = await ensureEnvironmentAdmin()
+    user = await ensureUserWorkspace(user)
+    if (!user || user.active === false || !(await workspaceIsActive(user))) return res.status(401).json({ error: 'This account or workspace is inactive.' })
     if (payload.device_id) {
       const device = await one('auth_devices', { id: payload.device_id })
       if (device && device.active === false) return res.status(401).json({ error: 'This device session was revoked.' })
     }
-    req.user = { user: user.username, username: user.username, user_id: user.id, role: user.role, permissions: publicUser(user).permissions, device_id: payload.device_id }
+    req.user = { user: user.username, username: user.username, user_id: user.id, workspace_id: user.workspace_id, role: user.role, platform_admin: user.source === 'environment' || user.platform_admin === true, permissions: publicUser(user).permissions, device_id: payload.device_id }
     next()
   } catch { res.status(401).json({ error: 'Please sign in again.' }) }
 }
 
 function canAccess(user, feature, write = false) {
   if (user.role === 'admin') return true
+  if (user.role === 'owner') return OWNER_FEATURES.includes(feature)
   if (user.role === 'viewer') return !write && VIEWER_FEATURES.includes(feature)
   return user.role === 'custom' && (user.permissions || []).includes(feature)
 }
@@ -418,8 +470,13 @@ function permitAny(features, { write = false } = {}) {
   }
 }
 
+function platformOnly(req, res, next) {
+  if (!req.user.platform_admin) return res.status(403).json({ error: 'Platform administrator access is required.' })
+  next()
+}
+
 async function recordLogin(req, user, method) {
-  const device = { id: randomUUID(), username: user.username, user_id: user.id, role: user.role, active: true, login_method: method, last_login_at: now(), user_agent: req.headers['user-agent'] || '' }
+  const device = { id: randomUUID(), username: user.username, user_id: user.id, workspace_id: user.workspace_id || 'platform', role: user.role, active: true, login_method: method, last_login_at: now(), user_agent: req.headers['user-agent'] || '' }
   try {
     await Promise.race([
       insert('auth_devices', device),
@@ -436,16 +493,20 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, database: database ? 
 app.post('/api/auth/login', async (req, res) => {
   const username = String(req.body.username || '').trim()
   const password = String(req.body.password || '')
-  const expectedUser = process.env.USERNAME || 'admin'
+  const expectedUser = process.env.USERNAME || 'Admin'
   let user = await one('iam_users', { username_key: usernameKey(username) })
   let validPassword = false
   if (usernameKey(username) === usernameKey(expectedUser)) {
+    if (process.env.VERCEL && !process.env.PASSWORD && !process.env.PASSWORD_HASH) {
+      return res.status(503).json({ error: 'The platform administrator password is not configured.' })
+    }
     validPassword = process.env.PASSWORD_HASH
       ? await bcrypt.compare(password, process.env.PASSWORD_HASH)
       : password === (process.env.PASSWORD || 'admin')
     if (validPassword) user = await ensureEnvironmentAdmin()
   } else if (user?.password_hash) validPassword = await bcrypt.compare(password, user.password_hash)
-  if (!user || user.active === false || !validPassword) return res.status(401).json({ error: 'Invalid username or password.' })
+  user = await ensureUserWorkspace(user)
+  if (!user || user.active === false || !validPassword || !(await workspaceIsActive(user))) return res.status(401).json({ error: 'Invalid username or password, or the workspace is inactive.' })
   const device = await recordLogin(req, user, 'password')
   res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
 })
@@ -474,33 +535,52 @@ function signupInput(body, passwordRequired) {
   return { data: { ...data, email_key: data.email, username_key: usernameKey(data.requested_username) }, password }
 }
 
-async function createSignupRequest(req, mode) {
-  const parsed = signupInput(req.body, mode === 'password')
-  if (parsed.error) return { error: parsed.error }
-  const { data, password } = parsed
+async function accountConflict(data) {
+  const reservedAdmin = usernameKey(process.env.USERNAME || 'Admin')
+  if (data.username_key === reservedAdmin || data.username_key === 'admin') return { error: 'That username is reserved for platform administration.' }
   const users = await list('iam_users')
   if (users.some((user) => user.username_key === data.username_key)) return { error: 'That username already belongs to an IAM account.' }
   if (users.some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === data.email_key)) return { error: 'An IAM account already exists for this email. Please log in instead.' }
-  const requests = await list('signup_requests')
-  const existingOAuth = mode === 'oauth' && requests.find((row) => row.status === 'oauth_pending' && row.username_key === data.username_key && row.email_key === data.email_key)
-  if (existingOAuth) {
-    const patch = { ...data, updated_at: now(), user_agent: req.headers['user-agent'] || existingOAuth.user_agent || '' }
-    await update('signup_requests', { id: existingOAuth.id }, patch)
-    return { row: { ...existingOAuth, ...patch } }
+  return null
+}
+
+async function createWorkspaceAccount(req, { data, password = '', identity = null }) {
+  const conflict = await accountConflict(data)
+  if (conflict) return conflict
+  const workspaceId = randomUUID(), userId = randomUUID(), createdAt = now(), signupMethod = identity?.provider || 'password'
+  const profile = {
+    full_name: data.full_name, email: data.email, email_key: data.email_key, phone: data.phone, organization_name: data.organization_name,
+    organization_type: data.organization_type, job_title: data.job_title, team_size: data.team_size, website: data.website,
+    city: data.city, state: data.state, country: data.country, use_case: data.use_case, how_heard: data.how_heard, picture: identity?.picture || '',
   }
-  if (requests.some((row) => ['pending', 'oauth_pending'].includes(row.status) && (row.username_key === data.username_key || row.email_key === data.email_key))) return { error: 'A registration request already exists for this email or username.' }
-  const row = {
-    id: randomUUID(), ...data, signup_method: mode, status: mode === 'password' ? 'pending' : 'oauth_pending', terms_accepted: true,
-    password_hash: mode === 'password' ? await bcrypt.hash(password, 12) : '', created_at: now(), updated_at: now(), user_agent: req.headers['user-agent'] || '',
+  const workspace = {
+    id: workspaceId, name: workspaceName(profile, data.requested_username), active: true, plan: 'free', owner_user_id: userId,
+    profile, signup_method: signupMethod, created_at: createdAt, updated_at: createdAt,
   }
-  await insert('signup_requests', row)
-  return { row }
+  const user = {
+    id: userId, username: data.requested_username, username_key: data.username_key, role: 'owner', permissions: OWNER_FEATURES, active: true,
+    source: 'signup', workspace_id: workspaceId, signup_method: signupMethod, password_hash: password ? await bcrypt.hash(password, 12) : '', profile,
+    auth_providers: identity ? [{ provider: identity.provider, subject: identity.subject, email: identity.email, linked_at: createdAt }] : [],
+    created_at: createdAt, created_by: 'self_signup', updated_at: createdAt,
+  }
+  const signup = {
+    id: randomUUID(), ...data, workspace_id: workspaceId, iam_user_id: userId, signup_method: signupMethod, status: 'active', terms_accepted: true,
+    oauth_provider: identity?.provider || '', oauth_subject: identity?.subject || '', verified_at: identity ? createdAt : '',
+    created_at: createdAt, activated_at: createdAt, updated_at: createdAt, user_agent: req.headers['user-agent'] || '',
+  }
+  await insert('workspaces', workspace)
+  await insert('iam_users', user)
+  await insert('signup_requests', signup)
+  const device = await recordLogin(req, user, identity ? identity.provider : 'password')
+  return { workspace, user, signup, device, token: sign(user, device.id) }
 }
 
 app.post('/api/auth/signup', async (req, res, next) => { try {
-  const result = await createSignupRequest(req, 'password')
+  const parsed = signupInput(req.body, true)
+  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const result = await createWorkspaceAccount(req, { data: parsed.data, password: parsed.password })
   if (result.error) return res.status(400).json({ error: result.error })
-  res.status(201).json({ ok: true, request_id: result.row.id, message: 'Registration submitted for administrator approval.' })
+  res.status(201).json({ ok: true, token: result.token, user: publicUser(result.user), workspace: result.workspace, message: 'Your private workspace is ready.' })
 } catch (e) { next(e) } })
 app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
   const settings = oauthSettings(req.params.provider, req)
@@ -530,7 +610,8 @@ app.get('/api/auth/oauth/:provider/callback', async (req, res) => {
       await insert('oauth_tickets', ticket)
       return res.redirect(landingRedirect(req, 'oauth_signup_ticket', ticket.id))
     }
-    if (user.active === false) throw new Error('This IAM account is disabled. Contact an administrator.')
+    user = await ensureUserWorkspace(user)
+    if (user.active === false || !(await workspaceIsActive(user))) throw new Error('This account or workspace is disabled. Contact support.')
     if (!(user.auth_providers || []).some((provider) => provider.provider === identity.provider && provider.subject === identity.subject)) {
       const authProviders = [...(user.auth_providers || []).filter((provider) => provider.provider !== identity.provider), { provider: identity.provider, subject: identity.subject, email: identity.email, linked_at: now() }]
       const profile = { ...(user.profile || {}), email: identity.email, email_key: identity.email, full_name: user.profile?.full_name || identity.name, picture: identity.picture || user.profile?.picture || '' }
@@ -548,8 +629,9 @@ app.post('/api/auth/oauth/exchange', async (req, res, next) => { try {
   const ticket = await consumeTransient('oauth_tickets', String(req.body.ticket || ''), { purpose: 'login' })
   if (!ticket) return res.status(401).json({ error: 'The social sign-in ticket is invalid or expired.' })
   const user = await one('iam_users', { id: ticket.user_id })
-  if (!user || user.active === false) return res.status(401).json({ error: 'This IAM account is not active.' })
-  res.json({ token: sign(user, ticket.device_id), user: publicUser(user), deviceId: ticket.device_id })
+  const activeUser = await ensureUserWorkspace(user)
+  if (!activeUser || activeUser.active === false || !(await workspaceIsActive(activeUser))) return res.status(401).json({ error: 'This account or workspace is not active.' })
+  res.json({ token: sign(activeUser, ticket.device_id), user: publicUser(activeUser), deviceId: ticket.device_id })
 } catch (e) { next(e) } })
 
 app.post('/api/auth/oauth/signup-context', async (req, res, next) => { try {
@@ -567,38 +649,28 @@ app.post('/api/auth/signup/oauth/complete', async (req, res, next) => { try {
   const identity = pendingTicket.identity || {}
   const parsed = signupInput({ ...req.body, email: identity.email, full_name: req.body.full_name || identity.name }, false)
   if (parsed.error) return res.status(400).json({ error: parsed.error })
-  const data = parsed.data
-  const users = await list('iam_users')
-  if (users.some((user) => user.username_key === data.username_key)) return res.status(409).json({ error: 'That username already belongs to an IAM account.' })
-  if (users.some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === identity.email)) return res.status(409).json({ error: 'An IAM account already exists for this verified email. Continue with the provider to log in.' })
-  const requests = await list('signup_requests')
-  if (requests.some((row) => row.status === 'pending' && (row.username_key === data.username_key || row.email_key === identity.email))) return res.status(409).json({ error: 'A signup request is already waiting for this email or username.' })
-  const legacyRequest = requests.find((row) => row.status === 'oauth_pending' && (row.username_key === data.username_key || row.email_key === identity.email))
+  const conflict = await accountConflict(parsed.data)
+  if (conflict) return res.status(409).json({ error: conflict.error })
   const consumedTicket = await consumeTransient('oauth_tickets', ticketId, { purpose: 'signup' })
   if (!consumedTicket) return res.status(409).json({ error: 'This social signup session was already used. Continue with the provider again.' })
-  const row = {
-    id: legacyRequest?.id || randomUUID(), ...data, email: identity.email, email_key: identity.email, signup_method: 'oauth', status: 'pending', terms_accepted: true,
-    oauth_provider: identity.provider, oauth_subject: identity.subject, oauth_picture: identity.picture || '', verified_at: now(), password_hash: '',
-    created_at: legacyRequest?.created_at || now(), updated_at: now(), user_agent: req.headers['user-agent'] || '',
-  }
-  if (legacyRequest) await update('signup_requests', { id: legacyRequest.id }, row)
-  else await insert('signup_requests', row)
-  res.status(201).json({ ok: true, request_id: row.id, message: 'Verified registration submitted for administrator approval.' })
+  const result = await createWorkspaceAccount(req, { data: parsed.data, identity })
+  if (result.error) return res.status(409).json({ error: result.error })
+  res.status(201).json({ ok: true, token: result.token, user: publicUser(result.user), workspace: result.workspace, message: 'Your private workspace is ready.' })
 } catch (e) { next(e) } })
 
 app.post('/api/auth/pem/challenge', async (req, res, next) => { try {
   const key = usernameKey(req.body.username)
-  const user = await one('iam_users', { username_key: key })
-  if (!user || user.active === false || !user.pem_public_key) return res.status(401).json({ error: 'PEM sign-in is not configured for this account.' })
+  const user = await ensureUserWorkspace(await one('iam_users', { username_key: key }))
+  if (!user || user.active === false || !(await workspaceIsActive(user)) || !user.pem_public_key) return res.status(401).json({ error: 'PEM sign-in is not configured for this active workspace.' })
   const row = { id: randomUUID(), username_key: key, challenge: randomBytes(32).toString('base64'), created_at: now(), expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(), used: false }
   await insert('auth_challenges', row)
   res.json({ challenge_id: row.id, challenge: row.challenge, expires_at: row.expires_at })
 } catch (e) { next(e) } })
 app.post('/api/auth/pem/login', async (req, res, next) => { try {
   const key = usernameKey(req.body.username), challengeId = String(req.body.challenge_id || ''), signature = String(req.body.signature || '')
-  const user = await one('iam_users', { username_key: key })
+  const user = await ensureUserWorkspace(await one('iam_users', { username_key: key }))
   const challenge = await consumeChallenge(challengeId, key)
-  if (!user || user.active === false || !user.pem_public_key || !challenge) return res.status(401).json({ error: 'The PEM challenge is invalid or expired. Please try again.' })
+  if (!user || user.active === false || !(await workspaceIsActive(user)) || !user.pem_public_key || !challenge) return res.status(401).json({ error: 'The PEM challenge is invalid, expired, or belongs to an inactive workspace.' })
   let valid = false
   try { valid = verifySignature('sha256', Buffer.from(challenge.challenge, 'base64'), user.pem_public_key, Buffer.from(signature, 'base64')) } catch { valid = false }
   if (!valid) return res.status(401).json({ error: 'The PEM file does not match this account.' })
@@ -610,57 +682,24 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json(publicUser(user))
 })
 
-app.get('/api/iam/signup-requests', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
-  const rows = await list('signup_requests')
-  rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
-  res.json(rows.map(publicSignupRequest))
-} catch (e) { next(e) } })
-app.post('/api/iam/signup-requests/:id/approve', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const signup = await one('signup_requests', { id: req.params.id })
-  if (!signup || signup.status !== 'pending') return res.status(404).json({ error: 'Pending signup request not found.' })
-  if (await one('iam_users', { username_key: signup.username_key })) return res.status(409).json({ error: 'That username already belongs to an IAM user.' })
-  if ((await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === signup.email_key)) return res.status(409).json({ error: 'That email already belongs to an IAM user.' })
-  if (signup.signup_method === 'password' && !signup.password_hash) return res.status(400).json({ error: 'This password registration no longer has valid credentials.' })
-  if (signup.signup_method === 'oauth' && (!signup.oauth_provider || !signup.oauth_subject)) return res.status(400).json({ error: 'Social signup verification is incomplete.' })
-  const profile = {
-    full_name: signup.full_name, email: signup.email, email_key: signup.email_key, phone: signup.phone, organization_name: signup.organization_name,
-    organization_type: signup.organization_type, job_title: signup.job_title, team_size: signup.team_size, website: signup.website,
-    city: signup.city, state: signup.state, country: signup.country, use_case: signup.use_case, how_heard: signup.how_heard, picture: signup.oauth_picture || '',
-  }
-  const row = {
-    id: randomUUID(), username: signup.requested_username, username_key: signup.username_key, role: 'viewer', permissions: VIEWER_FEATURES, active: true,
-    source: 'signup', password_hash: signup.password_hash || '', profile, signup_request_id: signup.id,
-    auth_providers: signup.oauth_provider ? [{ provider: signup.oauth_provider, subject: signup.oauth_subject, email: signup.email, linked_at: now() }] : [],
-    created_at: now(), created_by: req.user.user, updated_at: now(),
-  }
-  await insert('iam_users', row)
-  await update('signup_requests', { id: signup.id }, { status: 'approved', password_hash: '', approved_at: now(), approved_by: req.user.user, iam_user_id: row.id, updated_at: now() })
-  res.status(201).json(publicUser(row))
-} catch (e) { next(e) } })
-app.patch('/api/iam/signup-requests/:id/reject', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
-  const signup = await one('signup_requests', { id: req.params.id })
-  if (!signup || !['pending', 'oauth_pending'].includes(signup.status)) return res.status(404).json({ error: 'Open signup request not found.' })
-  await update('signup_requests', { id: signup.id }, { status: 'rejected', password_hash: '', rejected_at: now(), rejected_by: req.user.user, rejection_note: String(req.body.note || '').slice(0, 500), updated_at: now() })
-  res.json({ ok: true })
-} catch (e) { next(e) } })
-
 app.get('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (_req, res, next) => { try {
   await ensureEnvironmentAdmin()
-  const users = await list('iam_users')
+  const users = (await list('iam_users')).filter((user) => user.source !== 'signup')
   users.sort((a, b) => String(a.username).localeCompare(String(b.username)))
   res.json(users.map(publicUser))
 } catch (e) { next(e) } })
 app.post('/api/iam/users', auth, permit('iam', { adminOnly: true }), async (req, res, next) => { try {
   const username = String(req.body.username || '').trim(), key = usernameKey(username), password = String(req.body.password || '')
   const email = String(req.body.email || '').trim().toLocaleLowerCase()
-  const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
+  const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' })
   if (password.length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
+  if (key === usernameKey(process.env.USERNAME || 'Admin') || key === 'admin') return res.status(400).json({ error: 'That username is reserved for platform administration.' })
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address for social login.' })
   if (await one('iam_users', { username_key: key })) return res.status(409).json({ error: 'That username already exists.' })
   if (email && (await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
-  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
-  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', password_hash: await bcrypt.hash(password, 12), profile: email ? { email, email_key: email } : {}, created_at: now(), created_by: req.user.user, updated_at: now() }
+  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : VIEWER_FEATURES
+  const row = { id: randomUUID(), username, username_key: key, role, permissions, active: req.body.active !== false, source: 'managed', workspace_id: 'platform', platform_admin: false, password_hash: await bcrypt.hash(password, 12), profile: email ? { email, email_key: email } : {}, created_at: now(), created_by: req.user.user, updated_at: now() }
   await insert('iam_users', row)
   res.status(201).json(publicUser(row))
 } catch (e) { next(e) } })
@@ -668,14 +707,13 @@ app.patch('/api/iam/users/:id', auth, permit('iam', { adminOnly: true }), async 
   const user = await one('iam_users', { id: req.params.id })
   if (!user) return res.status(404).json({ error: 'IAM user not found.' })
   if (user.source === 'environment') return res.status(400).json({ error: 'The environment administrator is managed through Vercel environment variables.' })
-  const role = ['admin', 'custom', 'viewer'].includes(req.body.role) ? req.body.role : user.role
+  const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : (user.role === 'admin' ? 'custom' : user.role)
   const active = req.body.active === undefined ? user.active !== false : Boolean(req.body.active)
   const email = req.body.email === undefined ? String(user.profile?.email || '') : String(req.body.email || '').trim().toLocaleLowerCase()
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address for social login.' })
   if (email && (await list('iam_users')).some((row) => row.id !== user.id && usernameKey(row.profile?.email || row.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
-  if (user.id === req.user.user_id && (role !== 'admin' || !active)) return res.status(400).json({ error: 'You cannot remove your own administrator access.' })
-  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : role === 'admin' ? FEATURE_IDS : VIEWER_FEATURES
-  const patch = { role, active, permissions, profile: { ...(user.profile || {}), email, email_key: email }, updated_at: now(), updated_by: req.user.user }
+  const permissions = role === 'custom' ? [...new Set(req.body.permissions || [])].filter((id) => CUSTOM_FEATURE_IDS.includes(id)) : VIEWER_FEATURES
+  const patch = { role, active, permissions, platform_admin: false, profile: { ...(user.profile || {}), email, email_key: email }, updated_at: now(), updated_by: req.user.user }
   if (req.body.password) {
     if (String(req.body.password).length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
     patch.password_hash = await bcrypt.hash(String(req.body.password), 12)
@@ -726,59 +764,60 @@ function saleFromBody(body) {
     ...(body.passbook_source ? { passbook_source: clean(body.passbook_source) } : {}),
   }
 }
-app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (_req, res, next) => { try {
-  const rows = await list('sales'); rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date))); res.json(rows)
+app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (req, res, next) => { try {
+  const rows = await list('sales', workspaceQuery(req)); rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date))); res.json(rows)
 } catch (e) { next(e) } })
 app.post('/api/sales', auth, permitAny(['add-sale', 'passbook'], { write: true }), async (req, res, next) => { try {
   const row = saleFromBody(req.body)
   if (!row.customer_name || row.selling_price <= 0) return res.status(400).json({ error: 'Customer name and a valid selling price are required.' })
-  row.id = await nextId('sales'); row.created_at = new Date().toISOString(); row.created_by = req.user.user
+  row.id = await nextId('sales'); row.workspace_id = req.user.workspace_id; row.created_at = new Date().toISOString(); row.created_by = req.user.user
   await insert('sales', row); res.status(201).json(row)
 } catch (e) { next(e) } })
 app.put('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try {
-  const id = Number(req.params.id), current = await one('sales', { id })
+  const id = Number(req.params.id), query = workspaceQuery(req, { id }), current = await one('sales', query)
   if (!current) return res.status(404).json({ error: 'Transaction not found.' })
   const patch = saleFromBody({ ...current, ...req.body }); patch.updated_at = new Date().toISOString(); patch.updated_by = req.user.user
-  await update('sales', { id }, patch); res.json({ ...current, ...patch })
+  await update('sales', query, patch); res.json({ ...current, ...patch })
 } catch (e) { next(e) } })
-app.delete('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try { await remove('sales', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
+app.delete('/api/sales/:id', auth, permit('update', { write: true }), async (req, res, next) => { try { await remove('sales', workspaceQuery(req, { id: Number(req.params.id) })); res.status(204).end() } catch (e) { next(e) } })
 app.post('/api/sales/:id/payment', auth, permit('review', { write: true }), async (req, res, next) => { try {
-  const id = Number(req.params.id), row = await one('sales', { id })
+  const id = Number(req.params.id), query = workspaceQuery(req, { id }), row = await one('sales', query)
   if (!row) return res.status(404).json({ error: 'Transaction not found.' })
   const amount = Math.max(0, Math.min(Number(req.body.amount || 0), Number(row.pending_amount || 0)))
   if (!amount) return res.status(400).json({ error: 'Enter a valid collection amount.' })
   const paid = Number(row.amount_paid || 0) + amount, pending = Math.max(0, Number(row.selling_price || 0) - paid)
   const patch = { amount_paid: paid, pending_amount: pending, payment_received: pending <= 0 ? 1 : 0, last_payment_date: req.body.date || new Date().toISOString().slice(0, 10), last_payment_method: req.body.method || 'UPI', last_payment_received_by: req.body.received_by || req.user.user, updated_at: new Date().toISOString() }
-  await update('sales', { id }, patch); res.json({ ...row, ...patch })
+  await update('sales', query, patch); res.json({ ...row, ...patch })
 } catch (e) { next(e) } })
 
-app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (_req, res, next) => { try { const rows = await list('work_notes'); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
-app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
-app.delete('/api/notes/:id', auth, permit('notes', { write: true }), async (req, res, next) => { try { await remove('work_notes', { id: Number(req.params.id) }); res.status(204).end() } catch (e) { next(e) } })
+app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (req, res, next) => { try { const rows = await list('work_notes', workspaceQuery(req)); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
+app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), workspace_id: req.user.workspace_id, work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
+app.delete('/api/notes/:id', auth, permit('notes', { write: true }), async (req, res, next) => { try { await remove('work_notes', workspaceQuery(req, { id: Number(req.params.id) })); res.status(204).end() } catch (e) { next(e) } })
 
-app.get('/api/bills', auth, permit('bill'), async (_req, res, next) => { try { res.json(await list('bill_history')) } catch (e) { next(e) } })
-app.post('/api/bills', auth, permit('bill', { write: true }), async (req, res, next) => { try { const row = { ...req.body, bill_id: `SKB-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String(await nextId('bills')).padStart(4,'0')}`, generated_at: new Date().toISOString(), generated_by: req.user.user }; await insert('bill_history', row); res.json(row) } catch (e) { next(e) } })
+app.get('/api/bills', auth, permit('bill'), async (req, res, next) => { try { res.json(await list('bill_history', workspaceQuery(req))) } catch (e) { next(e) } })
+app.post('/api/bills', auth, permit('bill', { write: true }), async (req, res, next) => { try { const row = { ...req.body, workspace_id: req.user.workspace_id, bill_id: `BC-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String(await nextId('bills')).padStart(4,'0')}`, generated_at: new Date().toISOString(), generated_by: req.user.user }; await insert('bill_history', row); res.json(row) } catch (e) { next(e) } })
 app.post('/api/bills/generate', auth, permit('bill', { write: true }), async (req, res, next) => { try {
   const customerName = String(req.body.customer_name || '').trim()
   const scope = ['All Transactions', 'Last Transactions', 'Pending Transactions'].includes(req.body.bill_scope) ? req.body.bill_scope : 'All Transactions'
   const limit = Math.max(1, Math.min(Number(req.body.bill_limit || 5), 100))
   const billDate = String(req.body.bill_date || new Date().toISOString().slice(0, 10))
-  let rows = (await list('sales')).filter((row) => String(row.customer_name || '').toLocaleLowerCase() === customerName.toLocaleLowerCase())
+  let rows = (await list('sales', workspaceQuery(req))).filter((row) => String(row.customer_name || '').toLocaleLowerCase() === customerName.toLocaleLowerCase())
   if (scope === 'Pending Transactions') rows = rows.filter((row) => Number(row.pending_amount || 0) > 0)
   if (scope === 'Last Transactions') rows = rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date)) || Number(b.id) - Number(a.id)).slice(0, limit)
   rows.sort((a, b) => String(a.sale_date).localeCompare(String(b.sale_date)) || Number(a.id) - Number(b.id))
   if (!rows.length) return res.status(400).json({ error: scope === 'Pending Transactions' ? 'No pending transactions found for this customer.' : 'No purchases found for this customer.' })
   const dayKey = billDate.replaceAll('-', '')
-  const billId = `SKB-${dayKey}-${String(await nextId(`bill_${dayKey}`)).padStart(4, '0')}`
+  const billId = `BC-${dayKey}-${String(await nextId(`bill_${dayKey}`)).padStart(4, '0')}`
   const scopeLabel = scope === 'Last Transactions' ? `Last ${limit} Transactions` : scope
-  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel }, 90000, pythonRequestContext(req))
+  const workspace = await one('workspaces', { id: req.user.workspace_id })
+  const generated = await runPython('generate_bill', { sales: rows, customer_name: customerName, bill_id: billId, bill_date: billDate, bill_scope_label: scopeLabel, business_name: workspace?.name || req.user.username }, 90000, pythonRequestContext(req))
   const history = {
     bill_id: billId, bill_date: billDate, customer_name: customerName, customer_phone: generated.customer_phone,
     bill_scope: scope, bill_limit: scope === 'Last Transactions' ? limit : null, bill_scope_label: scopeLabel,
     purchase_count: rows.length, purchase_ids: rows.map((row) => Number(row.id)),
     items: rows.map((row) => ({ sale_id: Number(row.id), sale_date: row.sale_date, category: row.product_category || '', description: row.product_description || '', bill_amount: Number(row.selling_price || 0), paid_amount: Number(row.amount_paid || 0), pending_amount: Number(row.pending_amount || 0), paid_date: row.last_payment_date || row.payment_date || '-', status: Number(row.pending_amount || 0) <= 0 ? 'PAID [x]' : 'PENDING' })),
     total_bill: generated.total_bill, total_paid: generated.total_paid, total_pending: generated.total_pending,
-    upi_id: '9176619942@ybl', generated_at: new Date().toISOString(), generated_by: req.user.user,
+    workspace_id: req.user.workspace_id, business_name: workspace?.name || req.user.username, upi_id: '', generated_at: new Date().toISOString(), generated_by: req.user.user,
   }
   await insert('bill_history', history)
   const pdfBytes = Buffer.from(generated.pdf_base64, 'base64')
@@ -812,12 +851,57 @@ app.post('/api/smtp/test', auth, permit('technical', { adminOnly: true }), async
   const to = String(req.body.to || '').trim().toLocaleLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Enter a valid test recipient email address.' })
   const info = await sendConfiguredEmail({
-    to, subject: 'Shree Krishna Boutique SMTP test',
-    text: `Your boutique SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Shree Krishna Boutique workspace can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
+    to, subject: 'Boutique Cloud SMTP test',
+    text: `Your platform SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Boutique Cloud platform can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
   }, { allowDisabled: true })
   res.json({ ok: true, message_id: info.messageId || '', accepted: info.accepted || [] })
 } catch (e) { const message = smtpErrorMessage(e); console.error(`SMTP test failed: ${message}`); res.status(400).json({ error: message }) } })
+
+app.get('/api/platform/customers', auth, platformOnly, async (_req, res, next) => { try {
+  let users = await list('iam_users')
+  for (const user of users.filter((row) => row.source === 'signup' && !row.workspace_id)) await ensureUserWorkspace(user)
+  users = await list('iam_users')
+  const [workspaces, sales, notes, bills, vendors, devices, signups] = await Promise.all([
+    list('workspaces'), list('sales'), list('work_notes'), list('bill_history'), list('passbook_vendors'), list('auth_devices'), list('signup_requests'),
+  ])
+  const activityDate = (rows) => rows.map((row) => row.last_login_at || row.updated_at || row.generated_at || row.created_at || row.sale_date || '').filter(Boolean).sort().at(-1) || ''
+  const customers = workspaces.map((workspace) => {
+    const workspaceUsers = users.filter((row) => row.workspace_id === workspace.id)
+    const owner = workspaceUsers.find((row) => row.id === workspace.owner_user_id) || workspaceUsers.find((row) => row.role === 'owner') || workspaceUsers[0]
+    const workspaceSales = sales.filter((row) => row.workspace_id === workspace.id), workspaceNotes = notes.filter((row) => row.workspace_id === workspace.id)
+    const workspaceBills = bills.filter((row) => row.workspace_id === workspace.id), workspaceVendors = vendors.filter((row) => row.workspace_id === workspace.id)
+    const workspaceDevices = devices.filter((row) => row.workspace_id === workspace.id), signup = signups.find((row) => row.workspace_id === workspace.id)
+    const storageRows = [workspace, ...workspaceUsers, ...workspaceSales, ...workspaceNotes, ...workspaceBills, ...workspaceVendors, ...workspaceDevices, ...(signup ? [signup] : [])]
+    const revenue = workspaceSales.reduce((sum, row) => sum + Number(row.selling_price || 0), 0), pending = workspaceSales.reduce((sum, row) => sum + Number(row.pending_amount || 0), 0)
+    return {
+      id: workspace.id, name: workspace.name, active: workspace.active !== false, plan: workspace.plan || 'free', created_at: workspace.created_at,
+      signup_method: workspace.signup_method || owner?.signup_method || signup?.oauth_provider || signup?.signup_method || 'password', profile: workspace.profile || owner?.profile || {},
+      owner: owner ? publicUser(owner) : null, team_members: workspaceUsers.length, sales_count: workspaceSales.length,
+      customer_count: new Set(workspaceSales.map((row) => String(row.customer_name || '').trim().toLocaleLowerCase()).filter(Boolean)).size,
+      revenue, pending, notes_count: workspaceNotes.length, bills_count: workspaceBills.length, vendors_count: workspaceVendors.length,
+      login_count: workspaceDevices.length, last_login_at: activityDate(workspaceDevices), last_activity_at: activityDate([...workspaceSales, ...workspaceNotes, ...workspaceBills, ...workspaceDevices, workspace]),
+      storage_bytes: storageRows.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row || {}), 'utf8'), 0),
+    }
+  }).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+  res.json({
+    customers,
+    totals: {
+      workspaces: customers.length, active: customers.filter((row) => row.active).length,
+      users: customers.reduce((sum, row) => sum + row.team_members, 0), sales: customers.reduce((sum, row) => sum + row.sales_count, 0),
+      revenue: customers.reduce((sum, row) => sum + row.revenue, 0), storage_bytes: customers.reduce((sum, row) => sum + row.storage_bytes, 0),
+    },
+  })
+} catch (e) { next(e) } })
+
+app.patch('/api/platform/customers/:id', auth, platformOnly, async (req, res, next) => { try {
+  const workspace = await one('workspaces', { id: req.params.id })
+  if (!workspace) return res.status(404).json({ error: 'Customer workspace not found.' })
+  const active = req.body.active === undefined ? workspace.active !== false : Boolean(req.body.active)
+  const patch = { active, updated_at: now(), updated_by: req.user.user }
+  await update('workspaces', { id: workspace.id }, patch)
+  res.json({ ...workspace, ...patch })
+} catch (e) { next(e) } })
 
 app.get('/api/backup', auth, permit('backup', { adminOnly: true }), async (_req, res, next) => { try { const data = {}; for (const name of backupCollections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 4, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
 app.post('/api/restore', auth, permit('backup', { adminOnly: true }), async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of backupCollections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })
@@ -827,19 +911,19 @@ app.post('/api/passbook/parse', auth, permit('passbook', { write: true }), uploa
   const files = req.files.map((file) => ({ filename: file.originalname, base64: file.buffer.toString('base64') }))
   res.json(await runPython('parse_passbooks', { files }, 90000, pythonRequestContext(req)))
 } catch (e) { next(e) } })
-app.get('/api/passbook/vendors', auth, permit('passbook'), async (_req, res, next) => { try {
-  const rows = await list('passbook_vendors'); res.json(rows.map((row) => row.name).filter(Boolean).sort((a, b) => a.localeCompare(b)))
+app.get('/api/passbook/vendors', auth, permit('passbook'), async (req, res, next) => { try {
+  const rows = await list('passbook_vendors', workspaceQuery(req)); res.json(rows.map((row) => row.name).filter(Boolean).sort((a, b) => a.localeCompare(b)))
 } catch (e) { next(e) } })
 app.post('/api/passbook/vendors', auth, permit('passbook', { write: true }), async (req, res, next) => { try {
   const name = String(req.body.name || '').replace(/\s+/g, ' ').trim(), key = name.toLocaleLowerCase()
   if (!name) return res.status(400).json({ error: 'Vendor name is required.' })
-  const existing = await one('passbook_vendors', { key })
-  const row = { key, name, updated_at: new Date().toISOString(), updated_by: req.user.user }
-  existing ? await update('passbook_vendors', { key }, row) : await insert('passbook_vendors', { ...row, created_at: new Date().toISOString() })
+  const query = workspaceQuery(req, { key }), existing = await one('passbook_vendors', query)
+  const row = { key, name, workspace_id: req.user.workspace_id, updated_at: new Date().toISOString(), updated_by: req.user.user }
+  existing ? await update('passbook_vendors', query, row) : await insert('passbook_vendors', { ...row, created_at: new Date().toISOString() })
   res.json(row)
 } catch (e) { next(e) } })
 app.delete('/api/passbook/vendors/:name', auth, permit('passbook', { write: true }), async (req, res, next) => { try {
-  await remove('passbook_vendors', { key: decodeURIComponent(req.params.name).toLocaleLowerCase() }); res.status(204).end()
+  await remove('passbook_vendors', workspaceQuery(req, { key: decodeURIComponent(req.params.name).toLocaleLowerCase() })); res.status(204).end()
 } catch (e) { next(e) } })
 
 async function askAI(question, context) {
@@ -858,7 +942,7 @@ async function askAI(question, context) {
   throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.')
 }
 app.post('/api/ai', auth, permit('ai'), async (req, res, next) => { try {
-  const sales = (await list('sales')).slice(-150), notes = (await list('work_notes')).slice(-30)
+  const sales = (await list('sales', workspaceQuery(req))).slice(-150), notes = (await list('work_notes', workspaceQuery(req))).slice(-30)
   const context = JSON.stringify({ sales, notes }).slice(0, 80000)
   res.json({ answer: await askAI(String(req.body.question || ''), context) })
 } catch (e) { next(e) } })

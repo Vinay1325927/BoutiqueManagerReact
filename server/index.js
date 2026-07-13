@@ -5,10 +5,11 @@ import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import { MongoClient } from 'mongodb'
+import nodemailer from 'nodemailer'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
-import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from 'node:crypto'
 
 dotenv.config({ path: '.env', override: true, quiet: true })
 
@@ -118,6 +119,13 @@ async function consumeTransient(name, id, match = {}) {
   const row = await one(name, { id })
   if (!row || row.used || row.expires_at <= usedAt || Object.entries(match).some(([key, value]) => row[key] !== value)) return null
   row.used = true; row.used_at = usedAt
+  return clean(row)
+}
+
+async function readTransient(name, id, match = {}) {
+  const row = await one(name, { id })
+  const current = now()
+  if (!row || row.used || row.expires_at <= current || Object.entries(match).some(([key, value]) => row[key] !== value)) return null
   return clean(row)
 }
 
@@ -237,6 +245,63 @@ function readableError(value, fallback = 'Unexpected server error.') {
     try { return JSON.stringify(value) } catch { return fallback }
   }
   return String(value)
+}
+
+function encryptSecret(value) {
+  const key = createHash('sha256').update(process.env.SMTP_ENCRYPTION_KEY || jwtSecret).digest()
+  const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()])
+  return `v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${encrypted.toString('base64')}`
+}
+
+function decryptSecret(value) {
+  const [version, ivValue, tagValue, encryptedValue] = String(value || '').split(':')
+  if (version !== 'v1' || !ivValue || !tagValue || !encryptedValue) throw new Error('The saved SMTP password cannot be decrypted. Save the app password again.')
+  const key = createHash('sha256').update(process.env.SMTP_ENCRYPTION_KEY || jwtSecret).digest()
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivValue, 'base64'))
+  decipher.setAuthTag(Buffer.from(tagValue, 'base64'))
+  return Buffer.concat([decipher.update(Buffer.from(encryptedValue, 'base64')), decipher.final()]).toString('utf8')
+}
+
+function publicSmtp(value = {}) {
+  return {
+    provider: value.provider || 'gmail', enabled: value.enabled === true, host: value.host || 'smtp.gmail.com', port: Number(value.port || 465),
+    secure: value.secure !== false, user: value.user || '', from_name: value.from_name || 'Shree Krishna Boutique', from_email: value.from_email || '',
+    reply_to: value.reply_to || '', password_configured: Boolean(value.password_encrypted), updated_at: value.updated_at || '', updated_by: value.updated_by || '',
+  }
+}
+
+function smtpInput(body, old = {}) {
+  const provider = body.provider === 'custom' ? 'custom' : 'gmail'
+  const host = String(body.host || (provider === 'gmail' ? 'smtp.gmail.com' : '')).trim().slice(0, 200)
+  const portValue = Number(body.port || (body.secure === false ? 587 : 465)), port = Number.isInteger(portValue) && portValue > 0 && portValue <= 65535 ? portValue : 0
+  const user = String(body.user || '').trim().slice(0, 250), fromEmail = String(body.from_email || user).trim().toLocaleLowerCase().slice(0, 250)
+  const replyTo = String(body.reply_to || '').trim().toLocaleLowerCase().slice(0, 250), password = String(body.password || '')
+  if (!host || !port || !user) return { error: 'SMTP host, port and username are required.' }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fromEmail)) return { error: 'Enter a valid From email address.' }
+  if (replyTo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(replyTo)) return { error: 'Enter a valid Reply-to email address.' }
+  if (!password && !old.password_encrypted) return { error: provider === 'gmail' ? 'Enter a Google App Password.' : 'Enter the SMTP password.' }
+  return { value: {
+    provider, enabled: body.enabled !== false, host, port, secure: body.secure !== false, user,
+    from_name: String(body.from_name || 'Shree Krishna Boutique').replace(/[\r\n]/g, ' ').trim().slice(0, 120), from_email: fromEmail, reply_to: replyTo,
+    password_encrypted: password ? encryptSecret(provider === 'gmail' ? password.replace(/\s/g, '') : password) : old.password_encrypted,
+  } }
+}
+
+function smtpTransport(settings) {
+  if (!settings?.password_encrypted) throw new Error('SMTP credentials are not configured.')
+  return nodemailer.createTransport({
+    host: settings.host, port: Number(settings.port), secure: settings.secure === true,
+    auth: { user: settings.user, pass: decryptSecret(settings.password_encrypted) },
+    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000, tls: { minVersion: 'TLSv1.2' },
+  })
+}
+
+async function sendConfiguredEmail({ to, subject, text, html }) {
+  const settings = await one('app_settings', { id: 'global' }), smtp = settings?.smtp
+  if (!smtp?.enabled) throw new Error('SMTP email sending is not enabled.')
+  const transporter = smtpTransport(smtp)
+  return transporter.sendMail({ from: { name: smtp.from_name || 'Shree Krishna Boutique', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html })
 }
 
 function runPython(action, payload, timeoutMs = 90000, requestContext = {}) {
@@ -426,22 +491,11 @@ app.post('/api/auth/signup', async (req, res, next) => { try {
   if (result.error) return res.status(400).json({ error: result.error })
   res.status(201).json({ ok: true, request_id: result.row.id, message: 'Registration submitted for administrator approval.' })
 } catch (e) { next(e) } })
-app.post('/api/auth/signup/oauth/prepare', async (req, res, next) => { try {
-  const result = await createSignupRequest(req, 'oauth')
-  if (result.error) return res.status(400).json({ error: result.error })
-  res.status(201).json({ ok: true, request_id: result.row.id })
-} catch (e) { next(e) } })
-
 app.get('/api/auth/oauth/:provider/start', async (req, res, next) => { try {
-  const settings = oauthSettings(req.params.provider, req), intent = req.query.intent === 'signup' ? 'signup' : 'login'
+  const settings = oauthSettings(req.params.provider, req)
   if (!settings) return res.redirect(landingRedirect(req, 'oauth_error', 'Unsupported sign-in provider.'))
   if (!settings.clientId || !settings.clientSecret) return res.redirect(landingRedirect(req, 'oauth_error', `${settings.label} sign-in is not configured yet.`))
-  const requestId = String(req.query.request_id || '')
-  if (intent === 'signup') {
-    const signup = await one('signup_requests', { id: requestId })
-    if (!signup || signup.status !== 'oauth_pending') return res.redirect(landingRedirect(req, 'oauth_error', 'The social signup request is missing or expired.'))
-  }
-  const state = { id: randomUUID(), provider: settings.provider, intent, signup_request_id: requestId, used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
+  const state = { id: randomUUID(), provider: settings.provider, intent: 'continue', used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
   await insert('oauth_states', state)
   const url = new URL(settings.authorizeUrl)
   url.search = new URLSearchParams({ client_id: settings.clientId, redirect_uri: settings.redirectUri, response_type: 'code', scope: settings.scope, state: state.id, prompt: 'select_account' }).toString()
@@ -452,22 +506,20 @@ app.get('/api/auth/oauth/:provider/callback', async (req, res) => {
   const settings = oauthSettings(req.params.provider, req)
   try {
     if (!settings) throw new Error('Unsupported sign-in provider.')
-    if (req.query.error) throw new Error(String(req.query.error_description || req.query.error))
     const state = await consumeTransient('oauth_states', String(req.query.state || ''), { provider: settings.provider })
     if (!state) throw new Error('The sign-in request is invalid or expired.')
+    if (req.query.error) throw new Error(String(req.query.error_description || req.query.error))
     const identity = await exchangeOAuthCode(settings, String(req.query.code || ''))
     let user = await findIamUserForOAuth(identity)
-    if (state.intent === 'signup') {
-      if (user) throw new Error('An approved account already exists for this email. Please log in instead.')
-      const signup = await one('signup_requests', { id: state.signup_request_id })
-      if (!signup || signup.status !== 'oauth_pending') throw new Error('The signup request is no longer available.')
-      const duplicates = await list('signup_requests')
-      if (duplicates.some((row) => row.id !== signup.id && ['pending', 'oauth_pending'].includes(row.status) && row.email_key === identity.email)) throw new Error('An open request already exists for this verified email.')
-      const patch = { email: identity.email, email_key: identity.email, full_name: signup.full_name || identity.name, oauth_provider: identity.provider, oauth_subject: identity.subject, oauth_picture: identity.picture, status: 'pending', verified_at: now(), updated_at: now() }
-      await update('signup_requests', { id: signup.id }, patch)
-      return res.redirect(landingRedirect(req, 'signup_status', 'pending'))
+    if (!user) {
+      const ticket = {
+        id: randomUUID(), purpose: 'signup', identity, used: false, created_at: now(),
+        expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+      }
+      await insert('oauth_tickets', ticket)
+      return res.redirect(landingRedirect(req, 'oauth_signup_ticket', ticket.id))
     }
-    if (!user || user.active === false) throw new Error('No active IAM account matches this verified email. Submit a signup request first.')
+    if (user.active === false) throw new Error('This IAM account is disabled. Contact an administrator.')
     if (!(user.auth_providers || []).some((provider) => provider.provider === identity.provider && provider.subject === identity.subject)) {
       const authProviders = [...(user.auth_providers || []).filter((provider) => provider.provider !== identity.provider), { provider: identity.provider, subject: identity.subject, email: identity.email, linked_at: now() }]
       const profile = { ...(user.profile || {}), email: identity.email, email_key: identity.email, full_name: user.profile?.full_name || identity.name, picture: identity.picture || user.profile?.picture || '' }
@@ -475,18 +527,52 @@ app.get('/api/auth/oauth/:provider/callback', async (req, res) => {
       user = { ...user, auth_providers: authProviders, profile }
     }
     const device = await recordLogin(req, user, identity.provider)
-    const ticket = { id: randomUUID(), user_id: user.id, device_id: device.id, used: false, created_at: now(), expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() }
+    const ticket = { id: randomUUID(), purpose: 'login', user_id: user.id, device_id: device.id, used: false, created_at: now(), expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() }
     await insert('oauth_tickets', ticket)
     res.redirect(landingRedirect(req, 'oauth_ticket', ticket.id))
   } catch (error) { res.redirect(landingRedirect(req, 'oauth_error', readableError(error, 'Social sign-in failed.'))) }
 })
 
 app.post('/api/auth/oauth/exchange', async (req, res, next) => { try {
-  const ticket = await consumeTransient('oauth_tickets', String(req.body.ticket || ''))
+  const ticket = await consumeTransient('oauth_tickets', String(req.body.ticket || ''), { purpose: 'login' })
   if (!ticket) return res.status(401).json({ error: 'The social sign-in ticket is invalid or expired.' })
   const user = await one('iam_users', { id: ticket.user_id })
   if (!user || user.active === false) return res.status(401).json({ error: 'This IAM account is not active.' })
   res.json({ token: sign(user, ticket.device_id), user: publicUser(user), deviceId: ticket.device_id })
+} catch (e) { next(e) } })
+
+app.post('/api/auth/oauth/signup-context', async (req, res, next) => { try {
+  const ticket = await readTransient('oauth_tickets', String(req.body.ticket || ''), { purpose: 'signup' })
+  if (!ticket) return res.status(401).json({ error: 'The social signup session is invalid or expired. Continue with the provider again.' })
+  const identity = ticket.identity || {}
+  const suggestedUsername = String(identity.email || '').split('@')[0].replace(/[^A-Za-z0-9._-]/g, '').slice(0, 50)
+  res.json({ provider: identity.provider, email: identity.email, name: identity.name, picture: identity.picture, suggested_username: suggestedUsername })
+} catch (e) { next(e) } })
+
+app.post('/api/auth/signup/oauth/complete', async (req, res, next) => { try {
+  const ticketId = String(req.body.oauth_ticket || '')
+  const pendingTicket = await readTransient('oauth_tickets', ticketId, { purpose: 'signup' })
+  if (!pendingTicket) return res.status(401).json({ error: 'The social signup session is invalid or expired. Continue with the provider again.' })
+  const identity = pendingTicket.identity || {}
+  const parsed = signupInput({ ...req.body, email: identity.email, full_name: req.body.full_name || identity.name }, false)
+  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const data = parsed.data
+  const users = await list('iam_users')
+  if (users.some((user) => user.username_key === data.username_key)) return res.status(409).json({ error: 'That username already belongs to an IAM account.' })
+  if (users.some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === identity.email)) return res.status(409).json({ error: 'An IAM account already exists for this verified email. Continue with the provider to log in.' })
+  const requests = await list('signup_requests')
+  if (requests.some((row) => row.status === 'pending' && (row.username_key === data.username_key || row.email_key === identity.email))) return res.status(409).json({ error: 'A signup request is already waiting for this email or username.' })
+  const legacyRequest = requests.find((row) => row.status === 'oauth_pending' && (row.username_key === data.username_key || row.email_key === identity.email))
+  const consumedTicket = await consumeTransient('oauth_tickets', ticketId, { purpose: 'signup' })
+  if (!consumedTicket) return res.status(409).json({ error: 'This social signup session was already used. Continue with the provider again.' })
+  const row = {
+    id: legacyRequest?.id || randomUUID(), ...data, email: identity.email, email_key: identity.email, signup_method: 'oauth', status: 'pending', terms_accepted: true,
+    oauth_provider: identity.provider, oauth_subject: identity.subject, oauth_picture: identity.picture || '', verified_at: now(), password_hash: '',
+    created_at: legacyRequest?.created_at || now(), updated_at: now(), user_agent: req.headers['user-agent'] || '',
+  }
+  if (legacyRequest) await update('signup_requests', { id: legacyRequest.id }, row)
+  else await insert('signup_requests', row)
+  res.status(201).json({ ok: true, request_id: row.id, message: 'Verified registration submitted for administrator approval.' })
 } catch (e) { next(e) } })
 
 app.post('/api/auth/pem/challenge', async (req, res, next) => { try {
@@ -696,8 +782,31 @@ app.post('/api/bills/generate', auth, permit('bill', { write: true }), async (re
 app.get('/api/devices', auth, permit('security', { adminOnly: true }), async (_req, res, next) => { try { res.json(await list('auth_devices')) } catch (e) { next(e) } })
 app.patch('/api/devices/:id', auth, permit('security', { adminOnly: true }), async (req, res, next) => { try { await update('auth_devices', { id: req.params.id }, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true }) } catch (e) { next(e) } })
 
-app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { res.json((await one('app_settings', { id: 'global' })) || {}) } catch (e) { next(e) } })
-app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const row = { ...old, ...req.body, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); res.json(row) } catch (e) { next(e) } })
+app.get('/api/settings', auth, permit('technical'), async (_req, res, next) => { try { const row = (await one('app_settings', { id: 'global' })) || {}; const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
+app.put('/api/settings', auth, permit('technical', { write: true }), async (req, res, next) => { try { const old = await one('app_settings', { id: 'global' }); const { smtp: _ignoredSmtp, ...input } = req.body || {}; const row = { ...old, ...input, smtp: old?.smtp, id: 'global', updated_at: new Date().toISOString(), updated_by: req.user.user }; old ? await update('app_settings', { id: 'global' }, row) : await insert('app_settings', row); const { smtp: _smtp, ...safe } = row; res.json(safe) } catch (e) { next(e) } })
+
+app.get('/api/smtp', auth, permit('technical', { adminOnly: true }), async (_req, res, next) => { try {
+  const settings = await one('app_settings', { id: 'global' })
+  res.json(publicSmtp(settings?.smtp))
+} catch (e) { next(e) } })
+app.put('/api/smtp', auth, permit('technical', { adminOnly: true }), async (req, res, next) => { try {
+  const settings = await one('app_settings', { id: 'global' }), parsed = smtpInput(req.body || {}, settings?.smtp || {})
+  if (parsed.error) return res.status(400).json({ error: parsed.error })
+  const smtp = { ...parsed.value, updated_at: now(), updated_by: req.user.user }
+  if (settings) await update('app_settings', { id: 'global' }, { smtp, updated_at: now(), updated_by: req.user.user })
+  else await insert('app_settings', { id: 'global', smtp, updated_at: now(), updated_by: req.user.user })
+  res.json(publicSmtp(smtp))
+} catch (e) { next(e) } })
+app.post('/api/smtp/test', auth, permit('technical', { adminOnly: true }), async (req, res, next) => { try {
+  const to = String(req.body.to || '').trim().toLocaleLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Enter a valid test recipient email address.' })
+  const info = await sendConfiguredEmail({
+    to, subject: 'Shree Krishna Boutique SMTP test',
+    text: `Your boutique SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Shree Krishna Boutique workspace can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
+  })
+  res.json({ ok: true, message_id: info.messageId || '', accepted: info.accepted || [] })
+} catch (e) { next(new Error(`SMTP test failed: ${readableError(e)}`)) } })
 
 app.get('/api/backup', auth, permit('backup', { adminOnly: true }), async (_req, res, next) => { try { const data = {}; for (const name of backupCollections) data[name] = await list(name); res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`); res.json({ version: 4, created_at: new Date().toISOString(), data }) } catch (e) { next(e) } })
 app.post('/api/restore', auth, permit('backup', { adminOnly: true }), async (req, res, next) => { try { const data = req.body.data || {}; let inserted = 0; for (const name of backupCollections) for (const row of (data[name] || [])) { await insert(name, row); inserted++ } res.json({ inserted }) } catch (e) { next(e) } })

@@ -45,7 +45,11 @@ https://your-production-domain.vercel.app/api/auth/oauth/google/callback
 https://your-production-domain.vercel.app/api/auth/oauth/microsoft/callback
 ```
 
-`ADMIN_EMAIL` links the environment administrator to a social identity. Other users can submit a detailed Google, Microsoft, or password signup request. An administrator must approve it in **IAM → Signup approval queue** before login is allowed. Approved registrations start as Viewer accounts; an administrator can then change their role or selected feature access.
+`ADMIN_EMAIL` links the environment administrator to a social identity. **Continue with Google/Microsoft** is a unified flow: an approved email signs in immediately; a new email returns to a prefilled questionnaire and becomes a pending IAM request after submission. An administrator must approve it in **IAM → Signup approval queue** before login is allowed. Approved registrations start as Viewer accounts; an administrator can then change their role or selected feature access.
+
+### Gmail / SMTP email
+
+Set a stable `SMTP_ENCRYPTION_KEY` in Vercel, redeploy, then open **Technical → Outgoing email · SMTP** as an administrator. Gmail requires 2-Step Verification and a Google App Password; do not enter the normal Google account password. The app password is AES-256-GCM encrypted before it is stored in MongoDB. The Technical page includes a send-test action and also supports custom SMTP hosts.
 
 Passbook extraction and bill PDF generation are handled by `server/python_bridge.py`. Local development uses `.venv`; Vercel installs the minimal packages from `requirements.txt` for `api/pdf.py`.
 

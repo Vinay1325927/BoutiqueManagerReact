@@ -165,6 +165,10 @@ function publicUser(row) {
       filename: row.pem_filename || '',
       enrolled_at: row.pem_enrolled_at || '',
     },
+    mfa: {
+      email_otp: row.mfa_email_otp === true,
+      email: row.profile?.email || row.profile?.email_key || '',
+    },
   }
 }
 
@@ -481,9 +485,47 @@ async function createEmailOtp(email, purpose, metadata = {}) {
 async function verifyEmailOtp(email, purpose, code) {
   const rows = (await list('auth_challenges')).filter((row) => row.purpose === purpose && row.email === usernameKey(email) && !row.used && row.expires_at > now()).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
   const row = rows[0]
-  if (!row || !(await bcrypt.compare(String(code || ''), row.code_hash))) return false
+  if (!row || Number(row.attempts || 0) >= 5) return false
+  if (!(await bcrypt.compare(String(code || ''), row.code_hash))) { await update('auth_challenges', { id: row.id }, { attempts: Number(row.attempts || 0) + 1, last_attempt_at: now() }); return false }
   await update('auth_challenges', { id: row.id }, { used: true, used_at: now() })
   return true
+}
+
+function userEmail(user = {}) {
+  return String(user.profile?.email || user.profile?.email_key || '').trim().toLocaleLowerCase()
+}
+
+async function createLoginMfa(req, user, method) {
+  const email = userEmail(user)
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Email OTP MFA is enabled, but this user does not have a valid email address in IAM.')
+  const code = otpCode(), row = {
+    id: randomUUID(), purpose: 'login_mfa', email: usernameKey(email), user_id: user.id, workspace_id: user.workspace_id || 'platform',
+    method, code_hash: await bcrypt.hash(code, 10), used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    user_agent: req.headers['user-agent'] || '',
+  }
+  await insert('auth_challenges', row)
+  await sendConfiguredEmail({
+    to: email,
+    subject: `Boutique Cloud login code: ${code}`,
+    text: `Your Boutique Cloud login code is ${code}. It expires in 10 minutes.`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">Confirm your login</h2><p>Use this one-time code to finish signing in:</p><p style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not try to sign in, change your password and revoke unknown devices.</p></div>`,
+  })
+  return { mfa_required: true, challenge_id: row.id, email_hint: email.replace(/^(.{1,2}).*(@.*)$/, '$1***$2'), expires_at: row.expires_at }
+}
+
+async function finishLogin(req, res, user, method) {
+  if (user.mfa_email_otp === true) return res.json(await createLoginMfa(req, user, method))
+  const device = await recordLogin(req, user, method)
+  return res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
+}
+
+async function verifyLoginMfa(req, res, user, challengeId, code) {
+  const challenge = await readTransient('auth_challenges', challengeId, { purpose: 'login_mfa' })
+  if (!challenge || challenge.user_id !== user.id || challenge.email !== usernameKey(userEmail(user)) || Number(challenge.attempts || 0) >= 5) return res.status(401).json({ error: 'The login verification code is invalid or expired.' })
+  if (!(await bcrypt.compare(String(code || ''), challenge.code_hash))) { await update('auth_challenges', { id: challenge.id }, { attempts: Number(challenge.attempts || 0) + 1, last_attempt_at: now() }); return res.status(401).json({ error: 'The login verification code is invalid or expired.' }) }
+  await update('auth_challenges', { id: challenge.id }, { used: true, used_at: now() })
+  const device = await recordLogin(req, user, challenge.method || 'password')
+  return res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
 }
 
 function smtpErrorMessage(error) {
@@ -646,9 +688,16 @@ app.post('/api/auth/login', async (req, res) => {
   } else if (user?.password_hash) validPassword = await bcrypt.compare(password, user.password_hash)
   user = await ensureUserWorkspace(user)
   if (!user || user.active === false || !validPassword || !(await workspaceIsActive(user))) return res.status(401).json({ error: 'Invalid username or password, or the workspace is inactive.' })
-  const device = await recordLogin(req, user, 'password')
-  res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
+  return finishLogin(req, res, user, 'password')
 })
+
+app.post('/api/auth/mfa/verify', async (req, res, next) => { try {
+  const challenge = await readTransient('auth_challenges', String(req.body.challenge_id || ''), { purpose: 'login_mfa' })
+  if (!challenge) return res.status(401).json({ error: 'The login verification session is invalid or expired.' })
+  const user = await ensureUserWorkspace(await one('iam_users', { id: challenge.user_id }))
+  if (!user || user.active === false || !(await workspaceIsActive(user))) return res.status(401).json({ error: 'This account or workspace is inactive.' })
+  return verifyLoginMfa(req, res, user, challenge.id, req.body.otp)
+} catch (e) { next(e) } })
 
 function signupInput(body, passwordRequired) {
   const data = {
@@ -786,8 +835,7 @@ app.get('/api/auth/oauth/:provider/callback', async (req, res) => {
       await update('iam_users', { id: user.id }, { auth_providers: authProviders, profile, updated_at: now() })
       user = { ...user, auth_providers: authProviders, profile }
     }
-    const device = await recordLogin(req, user, identity.provider)
-    const ticket = { id: randomUUID(), purpose: 'login', user_id: user.id, device_id: device.id, used: false, created_at: now(), expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() }
+    const ticket = { id: randomUUID(), purpose: 'login', user_id: user.id, method: identity.provider, used: false, created_at: now(), expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() }
     await insert('oauth_tickets', ticket)
     res.redirect(landingRedirect(req, 'oauth_ticket', ticket.id))
   } catch (error) { res.redirect(landingRedirect(req, 'oauth_error', readableError(error, 'Social sign-in failed.'))) }
@@ -799,7 +847,7 @@ app.post('/api/auth/oauth/exchange', async (req, res, next) => { try {
   const user = await one('iam_users', { id: ticket.user_id })
   const activeUser = await ensureUserWorkspace(user)
   if (!activeUser || activeUser.active === false || !(await workspaceIsActive(activeUser))) return res.status(401).json({ error: 'This account or workspace is not active.' })
-  res.json({ token: sign(activeUser, ticket.device_id), user: publicUser(activeUser), deviceId: ticket.device_id })
+  return finishLogin(req, res, activeUser, ticket.method || 'oauth')
 } catch (e) { next(e) } })
 
 app.post('/api/auth/oauth/signup-context', async (req, res, next) => { try {
@@ -842,8 +890,7 @@ app.post('/api/auth/pem/login', async (req, res, next) => { try {
   let valid = false
   try { valid = verifySignature('sha256', Buffer.from(challenge.challenge, 'base64'), user.pem_public_key, Buffer.from(signature, 'base64')) } catch { valid = false }
   if (!valid) return res.status(401).json({ error: 'The PEM file does not match this account.' })
-  const device = await recordLogin(req, user, 'pem')
-  res.json({ token: sign(user, device.id), user: publicUser(user), deviceId: device.id })
+  return finishLogin(req, res, user, 'pem')
 } catch (e) { next(e) } })
 app.get('/api/auth/me', auth, async (req, res) => {
   const user = await one('iam_users', { id: req.user.user_id })
@@ -1012,6 +1059,15 @@ app.patch('/api/devices/:id', auth, permit('security', { write: true }), async (
   const query = workspaceQuery(req, { id: req.params.id }), device = await one('auth_devices', query)
   if (!device) return res.status(404).json({ error: 'Device session not found.' })
   await update('auth_devices', query, { active: Boolean(req.body.active), updated_at: new Date().toISOString() }); res.json({ ok: true })
+} catch (e) { next(e) } })
+app.put('/api/iam/users/:id/mfa', auth, permit('security', { write: true }), async (req, res, next) => { try {
+  const query = workspaceQuery(req, { id: req.params.id }), user = await one('iam_users', query)
+  if (!user) return res.status(404).json({ error: 'IAM user not found.' })
+  const enabled = req.body.email_otp === true
+  if (enabled && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail(user))) return res.status(400).json({ error: 'Add a valid email to this IAM user before enabling email OTP MFA.' })
+  const patch = { mfa_email_otp: enabled, mfa_updated_at: now(), mfa_updated_by: req.user.user, updated_at: now() }
+  await update('iam_users', query, patch)
+  res.json(publicUser({ ...user, ...patch }))
 } catch (e) { next(e) } })
 
 app.get('/api/settings', auth, permit('settings'), async (req, res, next) => { try {

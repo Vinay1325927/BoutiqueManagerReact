@@ -27,7 +27,7 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits']
+const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits', 'expenses']
 const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets', 'backup_deliveries']
 for (const name of collections) memory.set(name, [])
 
@@ -135,12 +135,12 @@ async function readTransient(name, id, match = {}) {
   return clean(row)
 }
 
-const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
+const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'expenses', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
 const OWNER_FEATURES = [...BUSINESS_FEATURES, 'gmail', 'iam', 'security', 'smtp', 'technical', 'backup', 'settings']
 const PERSONAL_BOUTIQUE_FEATURES = OWNER_FEATURES
 const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
-const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'notes', 'ai']
+const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'expenses', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
 const now = () => new Date().toISOString()
 
@@ -437,7 +437,7 @@ function decryptSecret(value) {
 function publicSmtp(value = {}) {
   return {
     provider: value.provider || 'gmail', enabled: value.enabled === true, host: value.host || 'smtp.gmail.com', port: Number(value.port || 465),
-    secure: value.secure !== false, user: value.user || '', from_name: value.from_name || 'Boutique Cloud', from_email: value.from_email || '',
+    secure: value.secure !== false, user: value.user || '', from_name: value.from_name || 'Business Manager', from_email: value.from_email || '',
     reply_to: value.reply_to || '', password_configured: Boolean(value.password_encrypted), updated_at: value.updated_at || '', updated_by: value.updated_by || '',
   }
 }
@@ -454,7 +454,7 @@ function smtpInput(body, old = {}) {
   if (!password && !old.password_encrypted) return { error: provider === 'gmail' ? 'Enter a Google App Password.' : 'Enter the SMTP password.' }
   return { value: {
     provider, enabled: body.enabled !== false, host, port, secure: body.secure !== false, user,
-    from_name: String(body.from_name || 'Boutique Cloud').replace(/[\r\n]/g, ' ').trim().slice(0, 120), from_email: fromEmail, reply_to: replyTo,
+    from_name: String(body.from_name || 'Business Manager').replace(/[\r\n]/g, ' ').trim().slice(0, 120), from_email: fromEmail, reply_to: replyTo,
     password_encrypted: password ? encryptSecret(provider === 'gmail' ? password.replace(/\s/g, '') : password) : old.password_encrypted,
   } }
 }
@@ -472,14 +472,14 @@ async function sendConfiguredEmail({ to, subject, text, html, attachments }, { a
   const settings = await one('app_settings', { id: workspaceId === 'global' ? 'global' : `workspace:${workspaceId}` }), smtp = settings?.smtp
   if (!smtp?.enabled && !allowDisabled) throw new Error('SMTP email sending is not enabled.')
   const transporter = smtpTransport(smtp)
-  return transporter.sendMail({ from: { name: smtp.from_name || 'Boutique Cloud', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html, attachments })
+  return transporter.sendMail({ from: { name: smtp.from_name || 'Business Manager', address: smtp.from_email }, replyTo: smtp.reply_to || undefined, to, subject, text, html, attachments })
 }
 
 function otpCode() { return String(Math.floor(100000 + Math.random() * 900000)) }
 async function createEmailOtp(email, purpose, metadata = {}) {
   const code = otpCode(), row = { id: randomUUID(), purpose, email: usernameKey(email), code_hash: await bcrypt.hash(code, 10), metadata: clean(metadata), used: false, created_at: now(), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
   await insert('auth_challenges', row)
-  await sendConfiguredEmail({ to: email, subject: `Boutique Cloud verification code: ${code}`, text: `Your Boutique Cloud verification code is ${code}. It expires in 10 minutes.`, html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">Verify your email</h2><p>Use this one-time code:</p><p style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request it, ignore this email.</p></div>` })
+  await sendConfiguredEmail({ to: email, subject: `Business Manager verification code: ${code}`, text: `Your Business Manager verification code is ${code}. It expires in 10 minutes.`, html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">Verify your email</h2><p>Use this one-time code:</p><p style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request it, ignore this email.</p></div>` })
   return row.id
 }
 async function verifyEmailOtp(email, purpose, code) {
@@ -506,8 +506,8 @@ async function createLoginMfa(req, user, method) {
   await insert('auth_challenges', row)
   await sendConfiguredEmail({
     to: email,
-    subject: `Boutique Cloud login code: ${code}`,
-    text: `Your Boutique Cloud login code is ${code}. It expires in 10 minutes.`,
+    subject: `Business Manager login code: ${code}`,
+    text: `Your Business Manager login code is ${code}. It expires in 10 minutes.`,
     html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">Confirm your login</h2><p>Use this one-time code to finish signing in:</p><p style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not try to sign in, change your password and revoke unknown devices.</p></div>`,
   })
   return { mfa_required: true, challenge_id: row.id, email_hint: email.replace(/^(.{1,2}).*(@.*)$/, '$1***$2'), expires_at: row.expires_at }
@@ -1014,6 +1014,31 @@ app.get('/api/customer-credits', auth, permitAny(['dashboard','add-sale','review
   res.json({rows,balances})
 }catch(e){next(e)}})
 
+function expenseFromBody(body) {
+  const amount = Math.max(0, Number(body.amount || 0))
+  return {
+    expense_date: body.expense_date || new Date().toISOString().slice(0, 10),
+    category: String(body.category || 'General').trim().slice(0, 80),
+    description: String(body.description || '').trim().slice(0, 500),
+    amount,
+    payment_method: body.payment_method || 'UPI',
+    paid_to: String(body.paid_to || '').trim().slice(0, 160),
+    spend_type: body.spend_type === 'personal' ? 'personal' : 'business',
+    notes: String(body.notes || '').trim().slice(0, 1000),
+  }
+}
+app.get('/api/expenses', auth, permit('expenses'), async (req,res,next)=>{try{
+  const rows=await list('expenses',workspaceQuery(req));rows.sort((a,b)=>String(b.expense_date).localeCompare(String(a.expense_date))||Number(b.id||0)-Number(a.id||0));res.json(rows)
+}catch(e){next(e)}})
+app.post('/api/expenses', auth, permit('expenses', { write: true }), async (req,res,next)=>{try{
+  const row=expenseFromBody(req.body);if(!row.amount||!row.description)return res.status(400).json({error:'Description and a valid amount are required.'})
+  row.id=await nextId('expenses');row.workspace_id=req.user.workspace_id;row.created_at=now();row.created_by=req.user.user
+  await insert('expenses',row);res.status(201).json(row)
+}catch(e){next(e)}})
+app.delete('/api/expenses/:id', auth, permit('expenses', { write: true }), async (req,res,next)=>{try{
+  await remove('expenses',workspaceQuery(req,{id:Number(req.params.id)}));res.status(204).end()
+}catch(e){next(e)}})
+
 app.get('/api/notes', auth, permitAny(['notes', 'ai', 'technical']), async (req, res, next) => { try { const rows = await list('work_notes', workspaceQuery(req)); rows.sort((a,b) => String(b.work_date).localeCompare(String(a.work_date))); res.json(rows) } catch (e) { next(e) } })
 app.post('/api/notes', auth, permit('notes', { write: true }), async (req, res, next) => { try { const row = { id: await nextId('work_notes'), workspace_id: req.user.workspace_id, work_date: req.body.work_date, note: String(req.body.note || '').trim(), created_at: new Date().toISOString(), created_by: req.user.user }; if (!row.note) return res.status(400).json({ error: 'Note cannot be empty.' }); await insert('work_notes', row); res.json(row) } catch (e) { next(e) } })
 app.delete('/api/notes/:id', auth, permit('notes', { write: true }), async (req, res, next) => { try { await remove('work_notes', workspaceQuery(req, { id: Number(req.params.id) })); res.status(204).end() } catch (e) { next(e) } })
@@ -1156,9 +1181,9 @@ app.post('/api/smtp/test', auth, permit('smtp', { write: true }), async (req, re
   const to = String(req.body.to || '').trim().toLocaleLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Enter a valid test recipient email address.' })
   const info = await sendConfiguredEmail({
-    to, subject: 'Boutique Cloud SMTP test',
+    to, subject: 'Business Manager SMTP test',
     text: `Your platform SMTP connection is working. Test sent by ${req.user.user} at ${now()}.`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Boutique Cloud platform can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px"><h2 style="color:#2563eb">SMTP connection successful</h2><p>Your Business Manager workspace can now send email.</p><p style="color:#64748b;font-size:12px">Test sent by ${String(req.user.user).replace(/[<>&"']/g, '')} at ${now()}.</p></div>`,
   }, { allowDisabled: true, workspaceId: req.user.workspace_id })
   res.json({ ok: true, message_id: info.messageId || '', accepted: info.accepted || [] })
 } catch (e) { const message = smtpErrorMessage(e); console.error(`SMTP test failed: ${message}`); res.status(400).json({ error: message }) } })
@@ -1211,7 +1236,7 @@ app.patch('/api/platform/customers/:id', auth, platformOnly, async (req, res, ne
 app.get('/api/backup', auth, permit('backup'), async (req, res, next) => { try {
   const data = {}; for (const name of BUSINESS_COLLECTIONS) data[name] = await list(name, workspaceQuery(req))
   const workspace = await one('workspaces', { id: req.user.workspace_id })
-  res.setHeader('Content-Disposition', `attachment; filename="boutique-backup-${new Date().toISOString().slice(0,10)}.json"`)
+  res.setHeader('Content-Disposition', `attachment; filename="business-backup-${new Date().toISOString().slice(0,10)}.json"`)
   res.json({ version: 6, created_at: new Date().toISOString(), workspace: { id: req.user.workspace_id, name: workspace?.name || req.user.user }, data })
 } catch (e) { next(e) } })
 app.post('/api/restore', auth, permit('backup', { write: true }), async (req, res, next) => { try {
@@ -1251,7 +1276,7 @@ app.get('/api/cron/backups', async (req, res, next) => { try {
     const backup=await workspaceBackup(workspace.id), content=JSON.stringify(backup,null,2), hash=createHash('sha256').update(content.replace(/"created_at":\s*"[^"]+"/,'"created_at":""')).digest('hex')
     if (schedule.only_if_changed && schedule.last_content_hash===hash) { results.push({workspace_id:workspace.id,status:'unchanged'}); continue }
     try {
-      await sendConfiguredEmail({to:schedule.email,subject:`${workspace.name} backup · ${backup.created_at.slice(0,10)}`,text:'Your scheduled Boutique Cloud JSON recovery backup is attached.',html:`<p>Your scheduled <strong>${String(workspace.name).replace(/[<>&"']/g,'')}</strong> recovery backup is attached.</p>`,attachments:[{filename:`boutique-backup-${backup.created_at.slice(0,10)}.json`,content}]},{workspaceId:workspace.id})
+      await sendConfiguredEmail({to:schedule.email,subject:`${workspace.name} backup · ${backup.created_at.slice(0,10)}`,text:'Your scheduled Business Manager JSON recovery backup is attached.',html:`<p>Your scheduled <strong>${String(workspace.name).replace(/[<>&"']/g,'')}</strong> recovery backup is attached.</p>`,attachments:[{filename:`business-backup-${backup.created_at.slice(0,10)}.json`,content}]},{workspaceId:workspace.id})
       await update('workspaces',{id:workspace.id},{backup_schedule:{...schedule,last_sent_at:now(),last_content_hash:hash,last_status:'sent'}}); results.push({workspace_id:workspace.id,status:'sent'})
     } catch(error) { await update('workspaces',{id:workspace.id},{backup_schedule:{...schedule,last_attempt_at:now(),last_status:readableError(error)}}); results.push({workspace_id:workspace.id,status:'failed'}) }
   }
@@ -1282,20 +1307,20 @@ async function askAI(question, context) {
   const provider = (process.env.AI_PROVIDER || (process.env.GEMINI_API_KEY ? 'gemini' : 'openai')).toLowerCase()
   if (provider === 'gemini' && process.env.GEMINI_API_KEY) {
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: `You are a concise boutique business assistant.\n\nCONTEXT:\n${context}\n\nTASK:\n${question}` }] }] }) })
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: `You are a concise business finance assistant.\n\nCONTEXT:\n${context}\n\nTASK:\n${question}` }] }] }) })
     const json = await response.json(); if (!response.ok) throw new Error(json.error?.message || 'Gemini request failed')
     return json.candidates?.[0]?.content?.parts?.map((p) => p.text).join('\n') || 'No response.'
   }
   if (process.env.OPENAI_API_KEY) {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4.1-mini', messages: [{ role: 'system', content: 'You are a concise boutique business assistant.' }, { role: 'user', content: `CONTEXT:\n${context}\n\nTASK:\n${question}` }] }) })
+    const response = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4.1-mini', messages: [{ role: 'system', content: 'You are a concise business finance assistant.' }, { role: 'user', content: `CONTEXT:\n${context}\n\nTASK:\n${question}` }] }) })
     const json = await response.json(); if (!response.ok) throw new Error(json.error?.message || 'OpenAI request failed')
     return json.choices?.[0]?.message?.content || 'No response.'
   }
   throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.')
 }
 app.post('/api/ai', auth, permit('ai'), async (req, res, next) => { try {
-  const sales = (await list('sales', workspaceQuery(req))).slice(-150), notes = (await list('work_notes', workspaceQuery(req))).slice(-30)
-  const context = JSON.stringify({ sales, notes }).slice(0, 80000)
+  const sales = (await list('sales', workspaceQuery(req))).slice(-150), notes = (await list('work_notes', workspaceQuery(req))).slice(-30), expenses = (await list('expenses', workspaceQuery(req))).slice(-150)
+  const context = JSON.stringify({ sales, expenses, notes }).slice(0, 80000)
   res.json({ answer: await askAI(String(req.body.question || ''), context) })
 } catch (e) { next(e) } })
 

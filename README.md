@@ -1,8 +1,8 @@
-# Boutique Cloud
+# Business Manager
 
-A public, multi-tenant boutique operations product built with React, Express, MongoDB, and focused Python PDF services.
+A public, multi-tenant business operations product built with React, Express, MongoDB, and focused Python PDF services.
 
-Every public signup immediately creates a private workspace and signs its owner in. Business collections are scoped by `workspace_id`, so one customer cannot read or change another customer’s sales, notes, bills, vendors, passbook records, or AI context.
+Every public signup immediately creates a private workspace and signs its owner in. Business collections are scoped by `workspace_id`, so one customer cannot read or change another customer’s sales, expenses, notes, bills, vendors, passbook records, or AI context.
 
 ## Run locally
 
@@ -35,7 +35,7 @@ SMTP_ENCRYPTION_KEY=...
 
 Keep the platform password and all other secrets in Vercel; never commit them. The account named by `USERNAME` is the only platform administrator. Its interface and API access are limited to the private **Customer accounts** console with registration details, workspace status, activity, record counts, revenue, pending value, login history, and estimated MongoDB document usage. Stale environment administrators are disabled automatically.
 
-When `BOUTIQUE_USERNAME` and `BOUTIQUE_NAME` are set, the server creates a separate owner workspace for the platform owner’s own boutique. It intentionally reuses the platform `PASSWORD` or `PASSWORD_HASH`. Every workspace owner—including every new public signup—receives private Settings/branding, Technical, Email/SMTP, IAM, Security/PEM, and Backup/Restore controls. Existing legacy business records assigned to the old platform workspace are migrated into this boutique automatically.
+When `BOUTIQUE_USERNAME` and `BOUTIQUE_NAME` are set, the server creates a separate owner workspace for the platform owner’s own business. It intentionally reuses the platform `PASSWORD` or `PASSWORD_HASH`. Every workspace owner—including every new public signup—receives private Settings/branding, Technical, Email/SMTP, IAM, Security/PEM, and Backup/Restore controls. Existing legacy business records assigned to the old platform workspace are migrated into this owner workspace automatically.
 
 Public password signups require contact, organisation, location, an optional logo, and an email OTP delivered through the central platform SMTP account. There is no approval queue: successful verification creates a workspace owner account immediately. Customer owners never see the platform console or other workspaces.
 
@@ -81,7 +81,8 @@ Vercel invokes the backup scheduler daily. `CRON_SECRET` protects that endpoint.
 - Email-OTP password signup and password recovery, plus Google and Microsoft identity
 - Tenant-isolated MongoDB business data
 - Platform-only customer and usage console
-- Sales and repeat-customer orders
+- Business-type aware wording for boutiques, retail, supermarkets, services, and wholesale teams
+- Sales, repeat-customer orders, expenses, and personal spend
 - Collections, customers, vendors, analytics, and reminders
 - Downloadable PDF bills and permanent bill history
 - Python passbook PDF extraction

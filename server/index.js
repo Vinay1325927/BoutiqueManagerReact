@@ -27,7 +27,7 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
-const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits', 'expenses']
+const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits', 'expenses', 'inventory']
 const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets', 'backup_deliveries']
 for (const name of collections) memory.set(name, [])
 
@@ -135,12 +135,12 @@ async function readTransient(name, id, match = {}) {
   return clean(row)
 }
 
-const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'expenses', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
+const BUSINESS_FEATURES = ['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'inventory', 'expenses', 'analytics', 'reminders', 'bill', 'passbook', 'notes', 'ai']
 const OWNER_FEATURES = [...BUSINESS_FEATURES, 'gmail', 'iam', 'security', 'smtp', 'technical', 'backup', 'settings']
 const PERSONAL_BOUTIQUE_FEATURES = OWNER_FEATURES
 const FEATURE_IDS = [...PERSONAL_BOUTIQUE_FEATURES, 'platform']
 const CUSTOM_FEATURE_IDS = OWNER_FEATURES
-const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'expenses', 'analytics', 'reminders', 'bill', 'notes', 'ai']
+const VIEWER_FEATURES = ['dashboard', 'review', 'customers', 'vendors', 'inventory', 'expenses', 'analytics', 'reminders', 'bill', 'notes', 'ai']
 const usernameKey = (value) => String(value || '').trim().toLocaleLowerCase()
 const now = () => new Date().toISOString()
 
@@ -971,6 +971,7 @@ function saleFromBody(body) {
     customer_name: String(body.customer_name || '').trim(), customer_phone: String(body.customer_phone || '').trim(),
     sale_date: body.sale_date || new Date().toISOString().slice(0, 10), vendor: String(body.vendor || '').trim(),
     product_category: body.product_category || 'Other', product_description: String(body.product_description || '').trim(),
+    inventory_id: body.inventory_id ? Number(body.inventory_id) : 0, barcode: String(body.barcode || '').trim(), sku: String(body.sku || '').trim(),
     buying_price: buying, selling_price: selling, amount_paid: Math.min(paid, selling), pending_amount: Math.max(0, selling - paid), store_credit_generated: Math.max(0, paid - selling),
     payment_received: paid >= selling ? 1 : 0, delay_status: body.delay_status ? 1 : 0,
     payment_method: body.payment_method || 'UPI', notes: String(body.notes || '').trim(),
@@ -978,14 +979,70 @@ function saleFromBody(body) {
     ...(body.passbook_source ? { passbook_source: clean(body.passbook_source) } : {}),
   }
 }
-app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (req, res, next) => { try {
+function inventoryFromBody(body) {
+  return {
+    barcode: String(body.barcode || '').trim(),
+    sku: String(body.sku || '').trim(),
+    name: String(body.name || body.product_description || '').trim().slice(0, 180),
+    category: String(body.category || body.product_category || 'Other').trim().slice(0, 80),
+    supplier: String(body.supplier || body.vendor || '').trim().slice(0, 160),
+    unit: String(body.unit || 'pcs').trim().slice(0, 30),
+    cost_price: Math.max(0, Number(body.cost_price || body.buying_price || 0)),
+    sale_price: Math.max(0, Number(body.sale_price || body.selling_price || 0)),
+    stock_qty: Math.max(0, Number(body.stock_qty || 0)),
+    reorder_level: Math.max(0, Number(body.reorder_level || 0)),
+    tax_rate: Math.max(0, Number(body.tax_rate || 0)),
+    active: body.active !== false,
+  }
+}
+async function adjustInventoryForSale(req, row) {
+  const qty = Math.max(1, Number(row.quantity || 1))
+  const query = row.inventory_id ? workspaceQuery(req, { id: Number(row.inventory_id) }) : row.barcode ? workspaceQuery(req, { barcode: row.barcode }) : null
+  if (!query) return
+  const item = await one('inventory', query)
+  if (!item) return
+  const nextStock = Math.max(0, Number(item.stock_qty || 0) - qty)
+  await update('inventory', query, { stock_qty: nextStock, updated_at: now(), updated_by: req.user.user })
+}
+app.get('/api/inventory', auth, permit('inventory'), async (req, res, next) => { try {
+  const rows = await list('inventory', workspaceQuery(req)); rows.sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')) || Number(a.id||0)-Number(b.id||0)); res.json(rows)
+} catch (e) { next(e) } })
+app.get('/api/inventory/lookup', auth, permitAny(['inventory', 'bill', 'add-sale']), async (req, res, next) => { try {
+  const code = String(req.query.barcode || req.query.sku || '').trim()
+  if (!code) return res.status(400).json({ error: 'Barcode or SKU is required.' })
+  const rows = await list('inventory', workspaceQuery(req))
+  const item = rows.find((x) => String(x.barcode || '').toLowerCase() === code.toLowerCase() || String(x.sku || '').toLowerCase() === code.toLowerCase())
+  if (!item) return res.status(404).json({ error: 'No inventory item found for this barcode.' })
+  res.json(item)
+} catch (e) { next(e) } })
+app.post('/api/inventory', auth, permit('inventory', { write: true }), async (req, res, next) => { try {
+  const row = inventoryFromBody(req.body)
+  if (!row.name || row.sale_price <= 0) return res.status(400).json({ error: 'Item name and selling price are required.' })
+  if (row.barcode) {
+    const existing = await one('inventory', workspaceQuery(req, { barcode: row.barcode }))
+    if (existing) return res.status(400).json({ error: 'This barcode already exists in inventory.' })
+  }
+  row.id = await nextId('inventory'); row.workspace_id = req.user.workspace_id; row.created_at = now(); row.created_by = req.user.user
+  await insert('inventory', row); res.status(201).json(row)
+} catch (e) { next(e) } })
+app.put('/api/inventory/:id', auth, permit('inventory', { write: true }), async (req, res, next) => { try {
+  const id = Number(req.params.id), query = workspaceQuery(req, { id }), current = await one('inventory', query)
+  if (!current) return res.status(404).json({ error: 'Inventory item not found.' })
+  const patch = inventoryFromBody({ ...current, ...req.body }); patch.updated_at = now(); patch.updated_by = req.user.user
+  await update('inventory', query, patch); res.json({ ...current, ...patch })
+} catch (e) { next(e) } })
+app.delete('/api/inventory/:id', auth, permit('inventory', { write: true }), async (req, res, next) => { try {
+  await remove('inventory', workspaceQuery(req, { id: Number(req.params.id) })); res.status(204).end()
+} catch (e) { next(e) } })
+app.get('/api/sales', auth, permitAny(['dashboard', 'add-sale', 'review', 'update', 'customers', 'vendors', 'inventory', 'analytics', 'reminders', 'bill', 'passbook', 'ai', 'technical']), async (req, res, next) => { try {
   const rows = await list('sales', workspaceQuery(req)); rows.sort((a, b) => String(b.sale_date).localeCompare(String(a.sale_date))); res.json(rows)
 } catch (e) { next(e) } })
-app.post('/api/sales', auth, permitAny(['add-sale', 'passbook'], { write: true }), async (req, res, next) => { try {
+app.post('/api/sales', auth, permitAny(['add-sale', 'passbook', 'bill'], { write: true }), async (req, res, next) => { try {
   const row = saleFromBody(req.body)
   if (!row.customer_name || row.selling_price <= 0) return res.status(400).json({ error: 'Customer name and a valid selling price are required.' })
   row.id = await nextId('sales'); row.workspace_id = req.user.workspace_id; row.created_at = new Date().toISOString(); row.created_by = req.user.user
   await insert('sales', row)
+  await adjustInventoryForSale(req, row)
   if (row.store_credit_generated > 0) await insert('customer_credits', { id:randomUUID(), workspace_id:req.user.workspace_id, customer_key:usernameKey(row.customer_name), customer_name:row.customer_name, customer_phone:row.customer_phone, amount:row.store_credit_generated, type:'credit', source_sale_id:row.id, created_at:now(), created_by:req.user.user })
   res.status(201).json(row)
 } catch (e) { next(e) } })
@@ -1319,8 +1376,8 @@ async function askAI(question, context) {
   throw new Error('Configure GEMINI_API_KEY or OPENAI_API_KEY on the server.')
 }
 app.post('/api/ai', auth, permit('ai'), async (req, res, next) => { try {
-  const sales = (await list('sales', workspaceQuery(req))).slice(-150), notes = (await list('work_notes', workspaceQuery(req))).slice(-30), expenses = (await list('expenses', workspaceQuery(req))).slice(-150)
-  const context = JSON.stringify({ sales, expenses, notes }).slice(0, 80000)
+  const sales = (await list('sales', workspaceQuery(req))).slice(-150), notes = (await list('work_notes', workspaceQuery(req))).slice(-30), expenses = (await list('expenses', workspaceQuery(req))).slice(-150), inventory = (await list('inventory', workspaceQuery(req))).slice(-200)
+  const context = JSON.stringify({ sales, expenses, inventory, notes }).slice(0, 80000)
   res.json({ answer: await askAI(String(req.body.question || ''), context) })
 } catch (e) { next(e) } })
 

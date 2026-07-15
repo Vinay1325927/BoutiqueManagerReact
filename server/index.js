@@ -27,6 +27,8 @@ const counters = new Map()
 let database = null
 let databasePromise = null
 
+const DEFAULT_PLATFORM_USERNAME = 'Vinay1325927'
+const DEFAULT_PLATFORM_PASSWORD = 'Srmrmp@1325927'
 const BUSINESS_COLLECTIONS = ['sales', 'work_notes', 'bill_history', 'passbook_vendors', 'customer_credits', 'expenses', 'inventory']
 const collections = [...BUSINESS_COLLECTIONS, 'workspaces', 'auth_devices', 'app_settings', 'iam_users', 'signup_requests', 'auth_challenges', 'oauth_states', 'oauth_tickets', 'backup_deliveries']
 for (const name of collections) memory.set(name, [])
@@ -173,7 +175,7 @@ function publicUser(row) {
 }
 
 async function ensureEnvironmentAdmin() {
-  const username = String(process.env.USERNAME || 'Admin').trim()
+  const username = String(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME).trim()
   const key = usernameKey(username)
   const environmentUsers = await list('iam_users', { source: 'environment' })
   const existing = environmentUsers.find((row) => row.username_key === key) || environmentUsers[0] || null
@@ -201,7 +203,7 @@ async function ensureEnvironmentAdmin() {
 async function sharedBoutiquePasswordHash(existingHash = '') {
   const configuredHash = String(process.env.PASSWORD_HASH || '').trim()
   if (configuredHash) return configuredHash
-  const password = String(process.env.PASSWORD || '')
+  const password = String(process.env.PASSWORD || DEFAULT_PLATFORM_PASSWORD)
   if (!password) return existingHash
   if (existingHash) {
     try { if (await bcrypt.compare(password, existingHash)) return existingHash } catch { /* replace an invalid legacy hash */ }
@@ -216,7 +218,7 @@ async function ensurePersonalBoutique() {
   if (!username || !businessName) throw new Error('Configure both BOUTIQUE_USERNAME and BOUTIQUE_NAME.')
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) throw new Error('BOUTIQUE_USERNAME must use only letters, numbers, dots, dashes or underscores.')
   const key = usernameKey(username)
-  if (key === usernameKey(process.env.USERNAME || 'Admin') || key === 'admin') throw new Error('BOUTIQUE_USERNAME must be different from the platform administrator.')
+  if (key === usernameKey(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME) || key === 'admin') throw new Error('BOUTIQUE_USERNAME must be different from the platform administrator.')
 
   const users = await list('iam_users')
   let user = users.find((row) => row.username_key === key) || null
@@ -610,7 +612,7 @@ async function auth(req, res, next) {
     const payload = jwt.verify(token, jwtSecret)
     let user
     if (payload.user_id) user = await one('iam_users', { id: payload.user_id })
-    else if (payload.role === 'admin' && usernameKey(payload.user) === usernameKey(process.env.USERNAME || 'Admin')) user = await ensureEnvironmentAdmin()
+    else if (payload.role === 'admin' && usernameKey(payload.user) === usernameKey(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME)) user = await ensureEnvironmentAdmin()
     user = await ensureUserWorkspace(user)
     if (!user || user.active === false || !(await workspaceIsActive(user))) return res.status(401).json({ error: 'This account or workspace is inactive.' })
     if (payload.device_id) {
@@ -670,7 +672,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, database: database ? 
 app.post('/api/auth/login', async (req, res) => {
   const username = String(req.body.username || '').trim()
   const password = String(req.body.password || '')
-  const expectedUser = process.env.USERNAME || 'Admin'
+  const expectedUser = process.env.USERNAME || DEFAULT_PLATFORM_USERNAME
   let user = await one('iam_users', { username_key: usernameKey(username) })
   if (!user && usernameKey(username) === usernameKey(process.env.BOUTIQUE_USERNAME || '')) {
     await ensurePersonalBoutique()
@@ -678,12 +680,12 @@ app.post('/api/auth/login', async (req, res) => {
   }
   let validPassword = false
   if (usernameKey(username) === usernameKey(expectedUser)) {
-    if (process.env.VERCEL && !process.env.PASSWORD && !process.env.PASSWORD_HASH) {
+    if (process.env.VERCEL && !process.env.PASSWORD && !process.env.PASSWORD_HASH && !DEFAULT_PLATFORM_PASSWORD) {
       return res.status(503).json({ error: 'The platform administrator password is not configured.' })
     }
     validPassword = process.env.PASSWORD_HASH
       ? await bcrypt.compare(password, process.env.PASSWORD_HASH)
-      : password === (process.env.PASSWORD || 'admin')
+      : password === (process.env.PASSWORD || DEFAULT_PLATFORM_PASSWORD)
     if (validPassword) user = await ensureEnvironmentAdmin()
   } else if (user?.password_hash) validPassword = await bcrypt.compare(password, user.password_hash)
   user = await ensureUserWorkspace(user)
@@ -726,7 +728,7 @@ function signupInput(body, passwordRequired) {
 }
 
 async function accountConflict(data) {
-  const reservedAdmin = usernameKey(process.env.USERNAME || 'Admin')
+  const reservedAdmin = usernameKey(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME)
   if (data.username_key === reservedAdmin || data.username_key === 'admin') return { error: 'That username is reserved for platform administration.' }
   const users = await list('iam_users')
   if (users.some((user) => user.username_key === data.username_key)) return { error: 'That username already belongs to an IAM account.' }
@@ -908,7 +910,7 @@ app.post('/api/iam/users', auth, permit('iam', { write: true }), async (req, res
   const role = ['custom', 'viewer'].includes(req.body.role) ? req.body.role : 'viewer'
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–50 characters and use only letters, numbers, dots, dashes or underscores.' })
   if (password.length < 8) return res.status(400).json({ error: 'Use a password with at least 8 characters.' })
-  if (key === usernameKey(process.env.USERNAME || 'Admin') || key === 'admin') return res.status(400).json({ error: 'That username is reserved for platform administration.' })
+  if (key === usernameKey(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME) || key === 'admin') return res.status(400).json({ error: 'That username is reserved for platform administration.' })
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address for social login.' })
   if (await one('iam_users', { username_key: key })) return res.status(409).json({ error: 'That username already exists.' })
   if (email && (await list('iam_users')).some((user) => usernameKey(user.profile?.email || user.profile?.email_key) === email)) return res.status(409).json({ error: 'That email is already linked to an IAM user.' })
@@ -1169,7 +1171,7 @@ app.put('/api/settings', auth, permit('settings', { write: true }), async (req, 
   if(profile.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(profile.email))return res.status(400).json({error:'Enter a valid business email address.'})
   if(profile.phone){const digits=profile.phone.replace(/\D/g,'');if(digits.length<7||digits.length>16)return res.status(400).json({error:'Enter a valid phone number.'})}
   if(profile.logo&&(!/^data:image\/(png|jpeg|webp);base64,/i.test(profile.logo)||profile.logo.length>1400000))return res.status(400).json({error:'Upload a PNG, JPEG or WebP logo smaller than 1 MB.'})
-  const users=await list('iam_users'), reserved=usernameKey(process.env.USERNAME||'Admin')
+  const users=await list('iam_users'), reserved=usernameKey(process.env.USERNAME || DEFAULT_PLATFORM_USERNAME)
   const requestedKey=usernameKey(requestedUsername),emailKey=usernameKey(profile.email)
   if(requestedKey===reserved||requestedKey==='admin'||users.some(row=>row.id!==workspace.owner_user_id&&row.username_key===requestedKey))return res.status(409).json({error:'That preferred username is already in use or reserved.'})
   if(emailKey&&users.some(row=>row.id!==workspace.owner_user_id&&usernameKey(row.profile?.email||row.profile?.email_key)===emailKey))return res.status(409).json({error:'That business email is already linked to another account.'})
